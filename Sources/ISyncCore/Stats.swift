@@ -21,6 +21,8 @@ public final class Stats {
         public var phase: Phase = .idle
         public var scannedSource = 0
         public var scannedDestination = 0
+        public var scanningSource: String? = nil
+        public var scanningDestination: String? = nil
         public var actionsTotal = 0
         public var actionsDone = 0
         public var workBytesTotal: Int64 = 0

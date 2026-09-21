@@ -144,8 +144,9 @@ func run() -> Int32 {
     DispatchQueue.global(qos: .userInitiated).async {
         let scanner = Scanner(options: ScanOptions(excludes: rules, oneFileSystem: opts.oneFileSystem, skipRelPaths: skipRelPaths),
                               cancelled: { cancellation.isCancelled },
-                              progress: { n in stats.update { $0.scannedSource = n } })
+                              progress: { n, dir in stats.update { $0.scannedSource = n; $0.scanningSource = dir } })
         sourceTree = scanner.scan(root: src, foldKeys: caseInsensitive)
+        stats.update { $0.scanningSource = nil }
         group.leave()
     }
     group.enter()
@@ -153,8 +154,9 @@ func run() -> Int32 {
         if isDirectory(dst) {
             let scanner = Scanner(options: ScanOptions(excludes: rules, oneFileSystem: opts.oneFileSystem),
                                   cancelled: { cancellation.isCancelled },
-                                  progress: { n in stats.update { $0.scannedDestination = n } })
+                                  progress: { n, dir in stats.update { $0.scannedDestination = n; $0.scanningDestination = dir } })
             destTree = scanner.scan(root: dst, foldKeys: caseInsensitive)
+            stats.update { $0.scanningDestination = nil }
         } else {
             destTree = Tree(root: dst, foldKeys: caseInsensitive, fsType: dstFS, rootDev: 0)
         }
@@ -363,6 +365,8 @@ final class FrameBuilder {
     private let actionMeter = RateMeter()
     private let verifyMeter = RateMeter()
     private let verifyCountMeter = RateMeter()
+    private let srcScanMeter = RateMeter(window: 10)
+    private let dstScanMeter = RateMeter(window: 10)
     private var spinnerIndex = 0
     private let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -380,8 +384,14 @@ final class FrameBuilder {
 
         switch s.phase {
         case .scanning, .planning:
+            srcScanMeter.add(Int64(s.scannedSource))
+            dstScanMeter.add(Int64(s.scannedDestination))
             out.append("\(spin) \(term.bold(s.phase == .scanning ? "Scanning" : "Planning"))   " + term.dim("elapsed \(Format.duration(elapsed))"))
-            out.append("  source \(Format.count(s.scannedSource)) items · destination \(Format.count(s.scannedDestination)) items")
+            let srcState = s.scanningSource == nil ? term.green("done") : term.dim("\(Int(srcScanMeter.rate))/s")
+            let dstState = s.scanningDestination == nil ? term.green("done") : term.dim("\(Int(dstScanMeter.rate))/s")
+            out.append("  source \(Format.count(s.scannedSource)) items \(srcState) · destination \(Format.count(s.scannedDestination)) items \(dstState)")
+            if let d = s.scanningSource { out.append("  " + term.dim(Format.fit("src: " + (d.isEmpty ? "/" : d), width - 4))) }
+            if let d = s.scanningDestination { out.append("  " + term.dim(Format.fit("dst: " + (d.isEmpty ? "/" : d), width - 4))) }
         default:
             ioMeter.add(s.ioBytes)
             let eta: Double

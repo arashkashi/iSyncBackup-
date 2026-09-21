@@ -42,11 +42,12 @@ public final class Scanner {
     }
 
     private let options: ScanOptions
-    private let progress: ((Int) -> Void)?
+    /// (entries so far, directory currently being read)
+    private let progress: ((Int, String) -> Void)?
     private var scannedCount = 0
     private var cancelled: () -> Bool
 
-    public init(options: ScanOptions, cancelled: @escaping () -> Bool = { false }, progress: ((Int) -> Void)? = nil) {
+    public init(options: ScanOptions, cancelled: @escaping () -> Bool = { false }, progress: ((Int, String) -> Void)? = nil) {
         self.options = options
         self.cancelled = cancelled
         self.progress = progress
@@ -57,11 +58,12 @@ public final class Scanner {
         let rootDev: dev_t = lstat(root, &st) == 0 ? st.st_dev : 0
         let tree = Tree(root: root, foldKeys: foldKeys, fsType: Scanner.fsTypeName(root), rootDev: rootDev)
         walk(directory: root, relPath: "", into: tree)
-        progress?(scannedCount)
+        progress?(scannedCount, "")
         return tree
     }
 
     private func walk(directory absPath: String, relPath parentRel: String, into tree: Tree) {
+        progress?(scannedCount, parentRel)
         guard let dir = opendir(absPath) else {
             tree.errors.append(SyncError(path: absPath, op: "opendir", message: errnoMessage()))
             return
@@ -133,7 +135,7 @@ public final class Scanner {
             tree.insert(entry)
 
             scannedCount += 1
-            if scannedCount % 500 == 0 { progress?(scannedCount) }
+            if scannedCount % 500 == 0 { progress?(scannedCount, parentRel) }
 
             if kind == .directory {
                 if options.oneFileSystem && st.st_dev != tree.rootDev {
