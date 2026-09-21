@@ -6,7 +6,7 @@ from the destination and SHA-256-checked before the tool says SYNCED.** A modern
 `rsync -a` on macOS — preserves Finder tags, extended attributes, resource forks, permissions and
 nanosecond timestamps on APFS — built in Swift with zero dependencies.
 
-![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-21%20unit%20%2B%2064%20e2e-success)
+![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-21%20unit%20%2B%2064%20e2e-success) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ```
 isync ~/Pictures /Volumes/BackupDrive/Pictures            # mirror; never deletes without --delete
@@ -46,6 +46,7 @@ versioned history with "go back to last Tuesday" (that is Time Machine's job). D
 - [FAQ](#faq)
 - [Testing](#testing)
 - [Roadmap](#roadmap)
+- [License](#license)
 
 ## Build and install
 
@@ -232,3 +233,7 @@ isync -q --delete --yes --report ~/backup-report.json /Volumes/Archive /Volumes/
 * Hard-link preservation (`nlink > 1` is already recorded per entry).
 * Persistent manifest in the destination for bit-rot detection without re-reading the source.
 * A SwiftUI front end over `ISyncCore` (the engine is a separate library target for this reason).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
