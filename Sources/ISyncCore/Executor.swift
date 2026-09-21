@@ -3,14 +3,16 @@ import CryptoKit
 
 public struct ExecOptions {
     public var dryRun = false
-    /// Parallel workers for the file phase. I/O bound: more than ~8 rarely helps on one disk.
+    /// Parallel workers for the file phases. I/O bound: more than ~8 rarely helps on one disk.
     public var jobs = 4
     /// Re-read every copied file from the destination and compare digests.
     public var verify = true
-    /// fsync each file before renaming it into place.
+    /// fsync each copied file before it is verified and stamped.
     public var fsync = true
     /// F_FULLFSYNC the destination once at the end.
     public var flushAtEnd = true
+    /// False on filesystems that cannot store permissions (avoids pointless metadata refreshes).
+    public var comparePermissions = true
     /// Called for every completed action (for `--verbose` logging). May be called from any thread.
     public var onAction: ((Action, String) -> Void)? = nil
     /// Called the moment an action fails, so errors can be shown while the run is still going.
@@ -20,13 +22,27 @@ public struct ExecOptions {
 }
 
 /// Executes a `Plan` against the filesystem, phase by phase, reporting into `Stats`.
+///
+/// Copies happen in two passes. Pass 1 streams data into place (temp file + atomic rename).
+/// Pass 2 walks the copied files *in the order they were written* — sequential on spinning
+/// disks — and for each one fsyncs, reads it back, compares the SHA-256, and only then applies
+/// the real permissions and the scanned mtime. Until pass 2 has run, a copied file carries a
+/// fresh mtime, so an interrupted run can never leave something that merely looks synced.
 public final class Executor {
+    private struct Pending {
+        let actionIndex: Int
+        let digest: SHA256Digest
+        let bytes: Int64
+    }
+
     private let plan: Plan
     private let source: Tree
     private let destination: Tree
     private let options: ExecOptions
     private let stats: Stats
     private let cancel: Cancellation
+    private let pendingLock = NSLock()
+    private var pending: [Pending] = []
 
     public init(plan: Plan, source: Tree, destination: Tree, options: ExecOptions, stats: Stats, cancellation: Cancellation) {
         self.plan = plan
@@ -45,20 +61,26 @@ public final class Executor {
         }
 
         stats.setPhase(.removingConflicts)
-        for a in plan.preDeletes { if cancel.isCancelled { return false }; perform(a, worker: 0) }
+        for a in plan.preDeletes { if cancel.isCancelled { return false }; perform(a, index: -1, worker: 0) }
 
         stats.setPhase(.creatingDirectories)
-        for a in plan.mkdirs { if cancel.isCancelled { return false }; perform(a, worker: 0) }
+        for a in plan.mkdirs { if cancel.isCancelled { return false }; perform(a, index: -1, worker: 0) }
 
         stats.setPhase(.syncingFiles)
-        runParallel(plan.fileActions)
-        if cancel.isCancelled { return false }
+        runParallel(count: plan.fileActions.count) { i, worker, buffer in
+            self.perform(self.plan.fileActions[i], index: i, worker: worker, buffer: buffer)
+        }
+        if cancel.isCancelled { noteUnfinalized(); return false }
+
+        stats.setPhase(.verifying)
+        finalizeCopies()
+        if cancel.isCancelled { noteUnfinalized(); return false }
 
         stats.setPhase(.deleting)
-        for a in plan.postDeletes { if cancel.isCancelled { return false }; perform(a, worker: 0) }
+        for a in plan.postDeletes { if cancel.isCancelled { return false }; perform(a, index: -1, worker: 0) }
 
         stats.setPhase(.directoryMetadata)
-        for a in plan.dirMeta { if cancel.isCancelled { return false }; perform(a, worker: 0) }
+        for a in plan.dirMeta { if cancel.isCancelled { return false }; perform(a, index: -1, worker: 0) }
 
         if options.flushAtEnd && !options.dryRun {
             stats.setPhase(.flushing)
@@ -69,25 +91,31 @@ public final class Executor {
         return !cancel.isCancelled
     }
 
-    private func runParallel(_ actions: [Action]) {
-        guard !actions.isEmpty else { return }
-        let workers = max(1, min(options.jobs, actions.count))
+    private func noteUnfinalized() {
+        pendingLock.lock(); let n = pending.count; pendingLock.unlock()
+        let done = stats.snapshot.finalizeDone
+        stats.update { $0.unfinalized = max(0, n - done) }
+    }
+
+    private func runParallel(count: Int, _ body: @escaping (Int, Int, UnsafeMutableRawPointer) -> Void) {
+        guard count > 0 else { return }
+        let workers = max(1, min(options.jobs, count))
         let next = Counter()
         DispatchQueue.concurrentPerform(iterations: workers) { worker in
             let buffer = UnsafeMutableRawPointer.allocate(byteCount: FileOps.chunkSize, alignment: 4096)
             defer { buffer.deallocate() }
             while !cancel.isCancelled {
                 let i = next.next()
-                guard i < actions.count else { break }
-                perform(actions[i], worker: worker, buffer: buffer)
+                guard i < count else { break }
+                body(i, worker, buffer)
             }
             stats.setCurrent(worker: worker, nil)
         }
     }
 
-    // MARK: - Individual actions
+    // MARK: - Pass 1: individual actions
 
-    private func perform(_ a: Action, worker: Int, buffer: UnsafeMutableRawPointer? = nil) {
+    private func perform(_ a: Action, index: Int, worker: Int, buffer: UnsafeMutableRawPointer? = nil) {
         let srcPath = source.absolutePath(a.relPath)
         let dstPath = destination.absolutePath(a.relPath)
         var outcome = ""
@@ -99,14 +127,14 @@ public final class Executor {
                 stats.update { $0.dirsCreated += 1 }
 
             case .copy:
-                outcome = try copy(a, from: srcPath, to: dstPath, worker: worker, buffer: buffer!)
+                outcome = try copy(a, index: index, from: srcPath, to: dstPath, worker: worker, buffer: buffer!)
 
             case .hashCompare:
-                outcome = try hashCompare(a, srcPath: srcPath, dstPath: dstPath, worker: worker, buffer: buffer!)
+                outcome = try hashCompare(a, index: index, srcPath: srcPath, dstPath: dstPath, worker: worker, buffer: buffer!)
 
             case .updateMeta:
                 outcome = "metadata"
-                if !options.dryRun { try FileOps.copyMetadata(from: srcPath, to: dstPath) }
+                if !options.dryRun { try FileOps.copyMetadata(from: srcPath, to: dstPath, mtime: a.src!.mtime) }
                 stats.update { $0.metaUpdated += 1 }
 
             case .symlink:
@@ -148,7 +176,7 @@ public final class Executor {
         options.onAction?(a, outcome)
     }
 
-    private func copy(_ a: Action, from srcPath: String, to dstPath: String, worker: Int, buffer: UnsafeMutableRawPointer) throws -> String {
+    private func copy(_ a: Action, index: Int, from srcPath: String, to dstPath: String, worker: Int, buffer: UnsafeMutableRawPointer) throws -> String {
         let src = a.src!
         stats.setCurrent(worker: worker, "→ \(a.relPath)")
         defer { stats.setCurrent(worker: worker, nil) }
@@ -159,39 +187,32 @@ public final class Executor {
             return "would copy (\(a.reason))"
         }
 
-        var verifying = false
         var accounted: Int64 = 0
-        let result: CopyResult
+        let digest: SHA256Digest
+        let bytes: Int64
         do {
-            result = try FileOps.copyFile(from: srcPath, to: dstPath, existing: a.dst, verify: options.verify,
-                                          fsync: options.fsync, buffer: buffer, cancelled: { self.cancel.isCancelled }) { srcBytes, io in
+            (digest, bytes) = try FileOps.copyData(from: srcPath, to: dstPath, existing: a.dst, buffer: buffer,
+                                                   cancelled: { self.cancel.isCancelled }) { srcBytes, io in
                 accounted += Int64(srcBytes)
                 self.stats.addWork(bytes: Int64(srcBytes), io: Int64(io))
-                if srcBytes == 0 && !verifying {
-                    verifying = true
-                    self.stats.setCurrent(worker: worker, "✓ verifying \(a.relPath)")
-                }
             }
         } catch {
-            // Keep the progress bar honest: the bytes this action was budgeted for are "done"
-            // (as a failure) even though they were never read.
+            // Keep the progress bar honest: this action's byte budget is spent even though it failed.
             if !(error is CancelledError) { stats.addWork(bytes: max(0, src.size - accounted), io: 0) }
             throw error
         }
+        pendingLock.lock()
+        pending.append(Pending(actionIndex: index, digest: digest, bytes: bytes))
+        pendingLock.unlock()
         stats.update {
             $0.filesCopied += 1
-            $0.bytesCopied += result.bytes
+            $0.bytesCopied += bytes
             if a.dst != nil { $0.filesUpdated += 1 }
-            if result.verified { $0.verified += 1 }
-            if result.sourceChangedDuringCopy { $0.sourceChangedDuringCopy += 1 }
         }
-        if result.sourceChangedDuringCopy {
-            stats.warning(SyncError(path: a.relPath, op: "copy", message: "source was modified while being copied; run again"))
-        }
-        return "copied (\(a.reason))" + (result.verified ? ", verified" : "")
+        return "copied (\(a.reason))"
     }
 
-    private func hashCompare(_ a: Action, srcPath: String, dstPath: String, worker: Int, buffer: UnsafeMutableRawPointer) throws -> String {
+    private func hashCompare(_ a: Action, index: Int, srcPath: String, dstPath: String, worker: Int, buffer: UnsafeMutableRawPointer) throws -> String {
         stats.setCurrent(worker: worker, "# hashing \(a.relPath)")
         defer { stats.setCurrent(worker: worker, nil) }
         let sd: SHA256Digest, dd: SHA256Digest
@@ -209,17 +230,66 @@ public final class Executor {
         }
         if sd == dd && sbytes == dbytes {
             // Same bytes. Only bring the metadata (mtime etc.) in line so the next run is a quick skip.
-            if !options.dryRun && a.dst.map({ !Planner.metaEqual(a.src!, $0, comparePermissions: true) || $0.mtime != a.src!.mtime }) ?? false {
-                try FileOps.copyMetadata(from: srcPath, to: dstPath)
+            if !options.dryRun, let d = a.dst, let s = a.src,
+               !Planner.metaEqual(s, d, comparePermissions: options.comparePermissions) || d.mtime != s.mtime {
+                try FileOps.copyMetadata(from: srcPath, to: dstPath, mtime: s.mtime)
             }
             stats.addWork(bytes: sbytes, io: 0)
             stats.update { $0.hashedIdentical += 1 }
             return "identical by SHA-256 (\(a.reason))"
         }
-        // Different: fall through to a real copy. The bytes already hashed are re-read; progress is
-        // accounted for by the copy itself.
+        // Different: fall through to a real copy.
         let copyAction = Action(kind: .copy, relPath: a.relPath, src: a.src, dst: a.dst, reason: "content changed")
-        return try copy(copyAction, from: srcPath, to: dstPath, worker: worker, buffer: buffer)
+        return try copy(copyAction, index: index, from: srcPath, to: dstPath, worker: worker, buffer: buffer)
+    }
+
+    // MARK: - Pass 2: fsync, read back, stamp metadata
+
+    private func finalizeCopies() {
+        pendingLock.lock()
+        let list = pending
+        pendingLock.unlock()
+        guard !list.isEmpty else { return }
+        stats.update {
+            $0.finalizeTotal = list.count
+            $0.finalizeBytesTotal = list.reduce(0) { $0 + $1.bytes }
+        }
+        runParallel(count: list.count) { i, worker, buffer in
+            let p = list[i]
+            let a = self.plan.fileActions[p.actionIndex]
+            let srcPath = self.source.absolutePath(a.relPath)
+            let dstPath = self.destination.absolutePath(a.relPath)
+            self.stats.setCurrent(worker: worker, (self.options.verify ? "✓ " : "· ") + a.relPath)
+            defer { self.stats.setCurrent(worker: worker, nil) }
+            var accounted: Int64 = 0
+            do {
+                let r = try FileOps.finalizeCopy(src: srcPath, dst: dstPath, entry: a.src!, expected: p.digest, expectedBytes: p.bytes,
+                                                 verify: self.options.verify, fsync: self.options.fsync, buffer: buffer,
+                                                 cancelled: { self.cancel.isCancelled }) { n in
+                    accounted += Int64(n)
+                    self.stats.update { $0.finalizeBytesDone += Int64(n); $0.ioBytes += Int64(n) }
+                }
+                self.stats.update {
+                    if r.verified { $0.verified += 1 }
+                    if r.sourceChanged { $0.sourceChangedDuringCopy += 1 }
+                }
+                if r.sourceChanged {
+                    self.stats.warning(SyncError(path: a.relPath, op: "copy", message: "source was modified during the run; run again to capture the latest version"))
+                }
+                self.options.onAction?(a, self.options.verify ? "verified" : "finalized")
+            } catch is CancelledError {
+                return
+            } catch {
+                self.stats.update { if self.options.verify { $0.verifyFailed += 1 } }
+                let e = SyncError(path: a.relPath, op: "verify", message: "\(error)")
+                self.stats.error(e)
+                self.options.onError?(e)
+            }
+            self.stats.update {
+                $0.finalizeDone += 1
+                $0.finalizeBytesDone += max(0, p.bytes - accounted)
+            }
+        }
     }
 }
 

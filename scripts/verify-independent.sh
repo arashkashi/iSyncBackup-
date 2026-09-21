@@ -9,8 +9,9 @@
 # extended attributes, and (with --hash) the SHA-256 of every regular file.
 # Ignores the same macOS housekeeping files isync excludes by default.
 set -u
+export LC_ALL=C   # byte-wise sort/grep: filenames are not guaranteed to be valid UTF-8
 SRC="${1:?source}"; DST="${2:?destination}"; HASH="${3:-}"
-IGNORE='(^|/)(\.DS_Store|\.Spotlight-V100|\.fseventsd|\.Trashes|\.TemporaryItems|\.DocumentRevisions-V100|\.isync-tmp-[^/]*|\.isync)(/|$)'
+IGNORE='(^|/)(\.DS_Store|\.Spotlight-V100|\.fseventsd|\.Trashes|\.TemporaryItems|\.DocumentRevisions-V100|\.isync-tmp-[^/]*|\.isync)(/|[:|]|$)'
 W="$(mktemp -d "${TMPDIR:-/tmp}/isync-verify.XXXXXX")"
 fail=0
 

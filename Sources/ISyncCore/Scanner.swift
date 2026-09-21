@@ -19,7 +19,7 @@ public struct ScanOptions {
 /// Walks a directory tree with `opendir`/`readdir`/`fstatat` (never following symlinks) and
 /// builds a `Tree`. Errors (unreadable directories, vanished files) are recorded, not thrown.
 public final class Scanner {
-    public static let version = "0.1.0"
+    public static let version = "0.2.0"
 
     /// `pathconf(_PC_CASE_SENSITIVE)` is 0 on the default macOS APFS/HFS+ volumes.
     public static func isCaseInsensitive(_ path: String) -> Bool {

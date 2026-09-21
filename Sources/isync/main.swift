@@ -244,6 +244,7 @@ func run() -> Int32 {
     execOptions.verify = opts.verify
     execOptions.fsync = opts.fsync
     execOptions.flushAtEnd = opts.fsync
+    execOptions.comparePermissions = !limited
     // Errors are shown the moment they happen, above the progress block, not just at the end.
     execOptions.onError = { e in term.log(term.red("  error: ") + e.description) }
     let listActions = (opts.verbose || opts.dryRun) && !opts.quiet
@@ -295,7 +296,9 @@ func run() -> Int32 {
     let verdict: String
     let exitCode: Int32
     if !completed {
-        verdict = "INTERRUPTED — NOT SYNCED. \(Format.count(s.actionsDone)) of \(Format.count(s.actionsTotal)) actions were completed; the destination is consistent for those. Run again to finish."
+        verdict = "INTERRUPTED — NOT SYNCED. \(Format.count(s.actionsDone)) of \(Format.count(s.actionsTotal)) actions were completed."
+            + (s.unfinalized > 0 ? " \(Format.count(s.unfinalized)) copied files were not yet verified; the next run re-checks them." : "")
+            + " Run again to finish."
         exitCode = 130
         term.log(term.red(term.bold("✖ " + verdict)))
     } else if !s.errors.isEmpty {
@@ -358,6 +361,8 @@ final class FrameBuilder {
     private let byteMeter = RateMeter()
     private let ioMeter = RateMeter()
     private let actionMeter = RateMeter()
+    private let verifyMeter = RateMeter()
+    private let verifyCountMeter = RateMeter()
     private var spinnerIndex = 0
     private let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -378,35 +383,52 @@ final class FrameBuilder {
             out.append("\(spin) \(term.bold(s.phase == .scanning ? "Scanning" : "Planning"))   " + term.dim("elapsed \(Format.duration(elapsed))"))
             out.append("  source \(Format.count(s.scannedSource)) items · destination \(Format.count(s.scannedDestination)) items")
         default:
-            byteMeter.add(s.workBytesDone)
             ioMeter.add(s.ioBytes)
-            actionMeter.add(Int64(s.actionsDone))
-            // Big files run first, so bytes finish long before the many small files do.
-            // Take the more pessimistic of the two estimates.
-            let byteRate = byteMeter.rate, actionRate = actionMeter.rate
-            let byteETA = byteRate > 0 ? Double(s.workBytesTotal - s.workBytesDone) / byteRate : 0
-            let actionETA = actionRate > 0 ? Double(s.actionsTotal - s.actionsDone) / actionRate : 0
-            let eta = max(byteETA, actionETA)
+            let eta: Double
+            let fraction: Double
+            let volume: String
+            if s.phase == .verifying {
+                verifyMeter.add(s.finalizeBytesDone)
+                verifyCountMeter.add(Int64(s.finalizeDone))
+                let bRate = verifyMeter.rate, cRate = verifyCountMeter.rate
+                eta = max(bRate > 0 ? Double(s.finalizeBytesTotal - s.finalizeBytesDone) / bRate : 0,
+                          cRate > 0 ? Double(s.finalizeTotal - s.finalizeDone) / cRate : 0)
+                fraction = s.finalizeBytesTotal > 0 ? Double(s.finalizeBytesDone) / Double(s.finalizeBytesTotal)
+                                                    : (s.finalizeTotal > 0 ? Double(s.finalizeDone) / Double(s.finalizeTotal) : 1)
+                volume = "\(Format.bytes(s.finalizeBytesDone)) / \(Format.bytes(s.finalizeBytesTotal))"
+            } else {
+                byteMeter.add(s.workBytesDone)
+                actionMeter.add(Int64(s.actionsDone))
+                // Big files run first, so bytes finish long before the many small files do.
+                // Take the more pessimistic of the two estimates.
+                let byteRate = byteMeter.rate, actionRate = actionMeter.rate
+                let byteETA = byteRate > 0 ? Double(s.workBytesTotal - s.workBytesDone) / byteRate : 0
+                let actionETA = actionRate > 0 ? Double(s.actionsTotal - s.actionsDone) / actionRate : 0
+                eta = max(byteETA, actionETA)
+                fraction = s.workBytesTotal > 0 ? Double(s.workBytesDone) / Double(s.workBytesTotal)
+                                                : (s.actionsTotal > 0 ? Double(s.actionsDone) / Double(s.actionsTotal) : 1)
+                volume = "\(Format.bytes(s.workBytesDone)) / \(Format.bytes(s.workBytesTotal))"
+            }
             let phaseName: String
             switch s.phase {
             case .removingConflicts: phaseName = "Removing replaced items"
             case .creatingDirectories: phaseName = "Creating directories"
-            case .syncingFiles: phaseName = dryRun ? "Checking files (dry run)" : "Syncing files"
+            case .syncingFiles: phaseName = dryRun ? "Checking files (dry run)" : "Copying files (pass 1/2)"
+            case .verifying: phaseName = "Verifying and stamping copies (pass 2/2)"
             case .deleting: phaseName = "Deleting extraneous items"
             case .directoryMetadata: phaseName = "Applying directory metadata"
             case .flushing: phaseName = "Flushing destination to disk"
             default: phaseName = s.phase.rawValue
             }
             out.append("\(spin) \(term.bold(phaseName))   " + term.dim("elapsed \(Format.duration(elapsed))")
-                       + (s.phase == .syncingFiles && eta > 0 ? term.dim(" · ETA \(Format.duration(eta))") : ""))
-            let fraction = s.workBytesTotal > 0 ? Double(s.workBytesDone) / Double(s.workBytesTotal) : (s.actionsTotal > 0 ? Double(s.actionsDone) / Double(s.actionsTotal) : 1)
+                       + ((s.phase == .syncingFiles || s.phase == .verifying) && eta > 0 ? term.dim(" · ETA \(Format.duration(eta))") : ""))
             let pct = String(format: "%5.1f%%", fraction * 100)
-            let right = " \(pct)  \(Format.bytes(s.workBytesDone)) / \(Format.bytes(s.workBytesTotal))  " + term.dim("I/O \(Format.rate(ioMeter.rate))")
+            let right = " \(pct)  \(volume)  " + term.dim("I/O \(Format.rate(ioMeter.rate))")
             let barWidth = max(10, min(50, width - 52))
             out.append("  " + term.green(Format.bar(fraction: fraction, width: barWidth)) + right)
-            var counters = ["actions \(Format.count(s.actionsDone))/\(Format.count(s.actionsTotal))",
-                            "copied \(Format.count(s.filesCopied))"]
-            if s.verified > 0 { counters.append("verified \(Format.count(s.verified))") }
+            var counters = s.phase == .verifying
+                ? ["verified \(Format.count(s.finalizeDone))/\(Format.count(s.finalizeTotal))"]
+                : ["actions \(Format.count(s.actionsDone))/\(Format.count(s.actionsTotal))", "copied \(Format.count(s.filesCopied))"]
             if s.hashedIdentical > 0 { counters.append("identical \(Format.count(s.hashedIdentical))") }
             if s.metaUpdated > 0 { counters.append("meta \(Format.count(s.metaUpdated))") }
             if s.deleted > 0 { counters.append("deleted \(Format.count(s.deleted))") }

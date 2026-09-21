@@ -6,7 +6,7 @@ from the destination and SHA-256-checked before the tool says SYNCED.** A modern
 `rsync -a` on macOS — preserves Finder tags, extended attributes, resource forks, permissions and
 nanosecond timestamps on APFS — built in Swift with zero dependencies.
 
-![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-21%20unit%20%2B%2064%20e2e-success) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-27%20unit%20%2B%2064%20e2e-success) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ```
 isync ~/Pictures /Volumes/BackupDrive/Pictures            # mirror; never deletes without --delete
@@ -87,13 +87,21 @@ Honest limits:
 2. **Plan** — a pure diff producing ordered actions: removals for type changes (file↔dir↔symlink),
    `mkdir`s, file work, deletions (children before parents), directory metadata (deepest first).
    Big files are scheduled first so all workers stay busy to the end.
-3. **Execute** file work on a pool of workers (`--jobs`, default = cores, max 8). Each copy:
-   stream source → temp file in the destination directory, hashing the bytes on the way →
-   `fsync` → atomic `rename()` over the target → copy permissions, flags, times, ACLs and
-   extended attributes (`copyfile(3)` — Finder tags, resource forks, quarantine info) →
-   re-read and compare. **A crash at any point leaves either the old file or the complete new one,
-   never a partial one.** If verification fails, the bad destination file is deleted so the next
-   run cannot mistake it for a good copy.
+3. **Execute** file work on a pool of workers (`--jobs`, default = cores, max 8), in two passes:
+   * **Pass 1 — copy.** Stream source → temp file in the destination directory, hashing the bytes
+     on the way → atomic `rename()` over the target. The file now has the right content but a
+     *fresh* mtime and `0600` permissions — deliberately not yet "stamped".
+   * **Pass 2 — verify and stamp.** Walk the copied files in the order they were written (sequential
+     on spinning disks): `fsync` → re-read bypassing the page cache → compare SHA-256 → apply
+     permissions, flags, ACLs, xattrs (`copyfile(3)`: Finder tags, resource forks, quarantine) →
+     stamp the mtime that was *scanned*, not the source's current one.
+
+   **A crash or Ctrl-C at any point leaves either the old file, the complete new file with a fresh
+   mtime (so the next run re-checks it), or a stray `.isync-tmp-*` — never a partial file under the
+   real name, and never a file that merely looks up to date.** If verification fails, the bad
+   destination file is deleted so the next run cannot mistake it for a good copy. If the source was
+   modified during the run, the backup keeps the timestamp of the content it actually holds, the
+   run ends with a warning (exit 3), and the next run picks up the new version.
 4. **Verdict** + optional JSON report (`--report run.json`) listing every error and every count.
 
 Names are matched the way the volume matches them: on case-insensitive APFS/HFS+ (the default),
@@ -209,6 +217,22 @@ compared) so every run does not "fix" things they cannot store. It has been test
 APFS→APFS; treat other targets as supported-but-less-tested and run `--compare hash` after the
 first sync.
 
+### It is slow on my external hard drive — what should I do?
+
+Spinning disks hate per-file seeks, and a verified copy costs a few per file. Three things help,
+in order of impact:
+
+1. **Exclude regenerable caches.** `.build/`, `node_modules/`, `.venv/`, `__pycache__/`,
+   `DerivedData/` in a `.isyncignore` typically remove more than half of all files.
+2. **Bulk-copy first, audit after.** For the first big copy onto a hard drive, skip the per-file
+   work and let the audit read everything sequentially afterwards — a stronger check delivered in a
+   drive-friendly order:
+   ```
+   isync -x --delete --no-fsync --no-verify SRC DST
+   isync -x --compare hash SRC DST
+   ```
+3. Keep `--jobs` low (`-j 2`) on a hard drive; parallel readers only add seeks.
+
 ### Can I schedule it?
 
 Yes. Exit code 0 means synced, anything else means look. A minimal `launchd` or cron line:
@@ -219,8 +243,9 @@ isync -q --delete --yes --report ~/backup-report.json /Volumes/Archive /Volumes/
 
 ## Testing
 
-* `swift test` — 21 unit tests on the planner (case folding, mtime windows, type conflicts,
-  delete ordering, flag masking, ignore rules).
+* `swift test` — 27 unit tests: the planner (case folding, mtime windows, type conflicts,
+  delete ordering, flag masking, ignore rules) and the two-pass copy (verification failure removes
+  the copy, scanned mtime is stamped even if the source changed, cancellation leaves no temp files).
 * `scripts/smoke-test.sh` — 64 end-to-end checks on a fixture tree: xattrs, modes, exact mtimes,
   symlinks (relative, dangling, retargeted), unicode names, empty files/dirs, FIFOs, immutable
   files, same-size edits, touch-only changes, type changes in both directions, extraneous items with

@@ -22,14 +22,6 @@ public struct FileOpError: Error, CustomStringConvertible {
 
 public struct CancelledError: Error {}
 
-public struct CopyResult {
-    public let digest: SHA256Digest
-    public let bytes: Int64
-    /// Source size or mtime differed between the start and end of the copy.
-    public let sourceChangedDuringCopy: Bool
-    public let verified: Bool
-}
-
 /// Low-level, crash-safe file operations. All paths are absolute.
 public enum FileOps {
     public static let chunkSize = 4 * 1024 * 1024
@@ -88,24 +80,19 @@ public enum FileOps {
         }
     }
 
-    /// Copy `src` to `dst` so that `dst` is either the old content or the complete new content,
-    /// never a partial file:
-    ///   1. stream source → temp file in the destination directory, hashing the bytes as they pass
-    ///   2. fsync the temp file (unless `fsync == false`)
-    ///   3. rename temp over `dst` (atomic on APFS/HFS+)
-    ///   4. copy permissions, flags, times, ACLs and xattrs onto `dst`
-    ///   5. if `verify`: re-read `dst` bypassing the page cache and compare digests;
-    ///      on mismatch `dst` is deleted so the next run cannot mistake it for a good copy
-    public static func copyFile(from src: String, to dst: String, existing: Entry?, verify: Bool, fsync doFsync: Bool,
+    /// Phase 1 of a copy: stream `src` → temp file in the destination directory (hashing on the
+    /// way) → atomic `rename()` over `dst`. On return `dst` holds the complete new content but has a
+    /// fresh mtime and 0600 permissions; `finalizeCopy` applies the real metadata after
+    /// verification. A crash at any point leaves the old file, the complete new one with a fresh
+    /// mtime (re-checked by the next run), or a stray `.isync-tmp-*` — never a partial file under
+    /// the real name, and never a partial file that looks up to date.
+    public static func copyData(from src: String, to dst: String, existing: Entry?,
                                 buffer: UnsafeMutableRawPointer, cancelled: () -> Bool,
-                                progress: (_ sourceBytes: Int, _ ioBytes: Int) -> Void) throws -> CopyResult {
+                                progress: (_ sourceBytes: Int, _ ioBytes: Int) -> Void) throws -> (SHA256Digest, Int64) {
         let sfd = open(src, O_RDONLY | O_NOFOLLOW)
         guard sfd >= 0 else { throw FileOpError("open source") }
         defer { close(sfd) }
         _ = fcntl(sfd, F_NOCACHE, 1)
-
-        var before = stat()
-        guard fstat(sfd, &before) == 0 else { throw FileOpError("fstat source") }
 
         let tmp = tempPath(near: dst)
         let dfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
@@ -133,43 +120,77 @@ public enum FileOps {
             total += Int64(n)
             progress(n, 2 * n)
         }
-        let digest = hasher.finalize()
-
-        if doFsync && fsync(dfd) != 0 { throw FileOpError("fsync") }
         if close(dfd) != 0 { tmpOpen = false; throw FileOpError("close temp file") }
         tmpOpen = false
 
         if let e = existing { clearImmutable(dst, flags: e.flags) }
         guard rename(tmp, dst) == 0 else { throw FileOpError("rename into place") }
         tmpExists = false
+        return (hasher.finalize(), total)
+    }
 
-        // Metadata last, after the data is in place: a crash before this point leaves a file with a
-        // fresh mtime, which the next run treats as "changed" and re-checks — self-healing.
-        if copyfile(src, dst, nil, COPYFILE_METADATA_ | COPYFILE_NOFOLLOW_SRC_ | COPYFILE_NOFOLLOW_DST_) != 0 {
-            throw FileOpError("copy metadata (xattrs/permissions/times)")
-        }
+    public struct FinalizeResult {
+        public let verified: Bool
+        /// The source no longer matches what was scanned (size or mtime differ).
+        public let sourceChanged: Bool
+    }
 
-        var after = stat()
-        var sourceChanged = false
-        if fstat(sfd, &after) == 0 {
-            sourceChanged = after.st_size != before.st_size || after.st_mtimespec != before.st_mtimespec
-        }
+    /// Phase 2 of a copy, run in a later pass so that on spinning disks the reads are sequential:
+    ///   1. `fsync` (optional) — the data is on the drive before we look at it
+    ///   2. read `dst` back bypassing the page cache and compare the SHA-256 (optional)
+    ///   3. apply permissions/flags/ACLs/xattrs from the source, then stamp the mtime that was
+    ///      *scanned*, not the source's current one — so if the source changed mid-run the
+    ///      backup never claims to be up to date with it
+    /// On a digest mismatch `dst` is deleted so the next run cannot mistake it for a good copy.
+    public static func finalizeCopy(src: String, dst: String, entry: Entry, expected: SHA256Digest, expectedBytes: Int64,
+                                    verify: Bool, fsync doFsync: Bool, buffer: UnsafeMutableRawPointer,
+                                    cancelled: () -> Bool, progress: (Int) -> Void) throws -> FinalizeResult {
+        let fd = open(dst, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else { throw FileOpError("open for verification") }
+        var fdOpen = true
+        defer { if fdOpen { close(fd) } }
+        if doFsync && fsync(fd) != 0 { throw FileOpError("fsync") }
 
-        var didVerify = false
         if verify {
-            let (readBack, readBytes) = try hashFile(dst, buffer: buffer, cancelled: cancelled) { n in progress(0, n) }
-            if readBack != digest || readBytes != total {
+            _ = fcntl(fd, F_NOCACHE, 1)
+            var hasher = SHA256()
+            var total: Int64 = 0
+            while true {
+                if cancelled() { throw CancelledError() }
+                let n = read(fd, buffer, chunkSize)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    throw FileOpError("read back")
+                }
+                if n == 0 { break }
+                hasher.update(bufferPointer: UnsafeRawBufferPointer(start: buffer, count: n))
+                total += Int64(n)
+                progress(n)
+            }
+            if hasher.finalize() != expected || total != expectedBytes {
+                close(fd); fdOpen = false
                 unlink(dst)
                 throw FileOpError("verify", "read-back digest does not match what was written (destination file removed)")
             }
-            didVerify = true
         }
-        return CopyResult(digest: digest, bytes: total, sourceChangedDuringCopy: sourceChanged, verified: didVerify)
+        close(fd); fdOpen = false
+
+        try copyMetadata(from: src, to: dst, mtime: entry.mtime)
+
+        var now = stat()
+        let changed = lstat(src, &now) == 0 && (Int64(now.st_size) != entry.size || now.st_mtimespec != entry.mtime)
+        return FinalizeResult(verified: verify, sourceChanged: changed)
     }
 
-    public static func copyMetadata(from src: String, to dst: String) throws {
+    /// Permissions, flags, ACLs, xattrs and times from `src`. When `mtime` is given, the
+    /// destination is stamped with that (scanned) value rather than the source's current one.
+    public static func copyMetadata(from src: String, to dst: String, mtime: timespec? = nil) throws {
         if copyfile(src, dst, nil, COPYFILE_METADATA_ | COPYFILE_NOFOLLOW_SRC_ | COPYFILE_NOFOLLOW_DST_) != 0 {
-            throw FileOpError("copy metadata")
+            throw FileOpError("copy metadata (xattrs/permissions/times)")
+        }
+        if let m = mtime {
+            var times = [m, m]
+            if utimensat(AT_FDCWD, dst, &times, AT_SYMLINK_NOFOLLOW) != 0 { throw FileOpError("set mtime") }
         }
     }
 

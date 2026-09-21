@@ -2,7 +2,7 @@ import Foundation
 
 public enum Phase: String, Codable {
     case idle, scanning, planning, confirming, removingConflicts, creatingDirectories,
-         syncingFiles, deleting, directoryMetadata, flushing, done, interrupted
+         syncingFiles, verifying, deleting, directoryMetadata, flushing, done, interrupted
 }
 
 /// Cooperative cancellation flag (set from a SIGINT handler, polled by workers).
@@ -34,6 +34,13 @@ public final class Stats {
         public var hashedIdentical = 0     // hashCompare found both sides equal
         public var verified = 0
         public var verifyFailed = 0
+        /// Second pass over copied files: fsync + read-back + metadata.
+        public var finalizeTotal = 0
+        public var finalizeDone = 0
+        public var finalizeBytesTotal: Int64 = 0
+        public var finalizeBytesDone: Int64 = 0
+        /// Copies left without metadata/verification because the run was interrupted.
+        public var unfinalized = 0
         public var symlinks = 0
         public var dirsCreated = 0
         public var dirMetaSet = 0
