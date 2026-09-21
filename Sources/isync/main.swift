@@ -244,6 +244,8 @@ func run() -> Int32 {
     execOptions.verify = opts.verify
     execOptions.fsync = opts.fsync
     execOptions.flushAtEnd = opts.fsync
+    // Errors are shown the moment they happen, above the progress block, not just at the end.
+    execOptions.onError = { e in term.log(term.red("  error: ") + e.description) }
     let listActions = (opts.verbose || opts.dryRun) && !opts.quiet
     if listActions {
         execOptions.onAction = { action, outcome in

@@ -13,6 +13,8 @@ public struct ExecOptions {
     public var flushAtEnd = true
     /// Called for every completed action (for `--verbose` logging). May be called from any thread.
     public var onAction: ((Action, String) -> Void)? = nil
+    /// Called the moment an action fails, so errors can be shown while the run is still going.
+    public var onError: ((SyncError) -> Void)? = nil
 
     public init() {}
 }
@@ -138,7 +140,9 @@ public final class Executor {
             return
         } catch {
             outcome = "ERROR \(error)"
-            stats.error(SyncError(path: a.relPath, op: a.kind.rawValue, message: "\(error)"))
+            let e = SyncError(path: a.relPath, op: a.kind.rawValue, message: "\(error)")
+            stats.error(e)
+            options.onError?(e)
         }
         stats.update { $0.actionsDone += 1 }
         options.onAction?(a, outcome)
