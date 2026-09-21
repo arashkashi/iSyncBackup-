@@ -103,6 +103,19 @@ check "extraneous removed"                       '[ ! -e "$DST/extra.txt" ] && [
 check "trees identical"                          'diff -r --exclude=a-fifo --exclude=.DS_Store "$SRC" "$DST" >/dev/null 2>&1'
 
 echo
+echo "4b) answering 'n' at the delete prompt keeps extras but syncs the rest"
+echo "junk" > "$DST/keep-me.txt"; echo "newer" > "$SRC/docs/another.txt"
+out="$(printf 'n\n' | "$ISYNC" --no-color --delete "$SRC" "$DST" 2>&1)"; rc=$?
+check "exit 0"                                   '[ $rc -eq 0 ]'
+check "extra kept"                               '[ -f "$DST/keep-me.txt" ]'
+check "other work still done"                    '[ -f "$DST/docs/another.txt" ]'
+check "verdict mentions extras remain"           'echo "$out" | grep -q "extra items remain"'
+out="$(printf 'q\n' | "$ISYNC" --no-color --delete "$SRC" "$DST" 2>&1)"; rc=$?
+check "'q' aborts with exit 1"                   '[ $rc -eq 1 ] && [ -f "$DST/keep-me.txt" ]'
+out="$(printf 'y\n' | "$ISYNC" --no-color --delete "$SRC" "$DST" 2>&1)"; rc=$?
+check "'y' deletes"                              '[ $rc -eq 0 ] && [ ! -e "$DST/keep-me.txt" ]'
+
+echo
 echo "5) type changes: file→dir, dir→file, symlink→file"
 rm "$SRC/docs/new.txt"; mkdir "$SRC/docs/new.txt"; echo "inside" > "$SRC/docs/new.txt/inner"
 rm -rf "$SRC/empty-dir"; echo "now a file" > "$SRC/empty-dir"

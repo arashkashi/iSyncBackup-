@@ -34,7 +34,8 @@ struct Options {
       -n, --dry-run             Show what would happen; change nothing (hashes are still computed).
           --delete              Remove items from destination that no longer exist in source.
           --force               Skip the safety guard that refuses to delete >25% of the destination.
-      -y, --yes                 Do not ask for confirmation before deleting.
+      -y, --yes                 Delete without asking (the prompt shows the list; "no" keeps the
+                                items and syncs the rest; no terminal counts as "no").
           --compare quick|hash  quick (default): size + mtime + permissions, hashing only when in doubt.
                                 hash: SHA-256 every file on both sides (full audit; reads everything).
           --no-verify           Skip re-reading each copied file to confirm the bytes on disk.

@@ -176,7 +176,7 @@ func run() -> Int32 {
     planOptions.mtimeWindow = mtimeWindow
     planOptions.deleteExtraneous = opts.delete
     planOptions.comparePermissions = !limited
-    let plan = Planner.plan(source: sourceTree, destination: destTree, options: planOptions)
+    var plan = Planner.plan(source: sourceTree, destination: destTree, options: planOptions)
     term.stopLive()
 
     for e in sourceTree.errors + destTree.errors { stats.error(e) }
@@ -222,16 +222,45 @@ func run() -> Int32 {
             return 1
         }
         if !opts.yes {
-            guard isatty(STDIN_FILENO) == 1 else {
-                term.log(term.red("✖ ") + "--delete needs confirmation; pass --yes when not running interactively.")
-                return 1
+            // Answers are read from stdin; end-of-input (e.g. cron with no terminal) counts as "no".
+            let extra = plan.postDeletes.count
+            let extraBytes = plan.postDeletes.reduce(0) { $0 + ($1.dst?.size ?? 0) }
+            if plan.typeConflicts > 0 {
+                term.log(term.yellow("  \(plan.typeConflicts) path(s) changed type and will be replaced either way (that is an update, not a deletion)."))
             }
-            FileHandle.standardError.write("Delete \(Format.count(plan.deleteCount)) item(s) (\(Format.bytes(plan.deleteBytes))) from the destination? [y/N] ".data(using: .utf8)!)
-            let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-            guard answer == "y" || answer == "yes" else {
-                term.log("Aborted; nothing was changed.")
-                return 1
+            if extra > 0 {
+                term.log("  \(Format.count(extra)) item(s) (\(Format.bytes(extraBytes))) exist only in the destination and would be deleted:")
+                let summary = DeletionSummary(plan.postDeletes)
+                let maxLines = 30
+                for line in summary.lines.prefix(maxLines) { term.log("    " + line) }
+                if summary.lines.count > maxLines {
+                    term.log(term.dim("    … and \(Format.count(summary.lines.count - maxLines)) more entries"))
+                }
+                var decided = false
+                while !decided {
+                    FileHandle.standardError.write("  Delete them?  [y] yes   [n] no — keep them, sync everything else   [l] list every path   [q] quit  (default n): ".data(using: .utf8)!)
+                    let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
+                    switch answer {
+                    case "y", "yes":
+                        decided = true
+                    case "l", "list":
+                        for a in plan.postDeletes.sorted(by: { $0.relPath < $1.relPath }) {
+                            let size = a.dst?.kind == .file ? "  " + Format.bytes(a.dst?.size ?? 0) : (a.dst?.kind == .directory ? "  (dir)" : "  (symlink)")
+                            term.log("    " + a.relPath + term.dim(size))
+                        }
+                    case "q", "quit", "a", "abort":
+                        term.log("Aborted; nothing was changed.")
+                        return 1
+                    default:
+                        plan.extraneous += extra
+                        plan.extraneousBytes += extraBytes
+                        plan.postDeletes = []
+                        term.log(term.dim("  keeping them; continuing without deletions" + (isatty(STDIN_FILENO) == 1 ? "" : " (no terminal; pass --yes to delete unattended)")))
+                        decided = true
+                    }
+                }
             }
+            term.log("")
         }
     }
 
@@ -353,6 +382,51 @@ func run() -> Int32 {
         catch { term.log(term.red("error: ") + "cannot write report: \(error)") }
     }
     return exitCode
+}
+
+/// Collapses a list of deletions for display: a directory that is deleted whole appears as one
+/// line with the number of items inside it, instead of every file under it.
+struct DeletionSummary {
+    private(set) var lines: [String] = []
+
+    init(_ deletions: [Action]) {
+        let deletedDirs = Set(deletions.filter { $0.dst?.kind == .directory }.map { $0.relPath })
+        // Top-most deleted ancestor of a path, if any.
+        func topDir(_ relPath: String) -> String? {
+            var top: String? = nil
+            var idx = relPath.startIndex
+            while let slash = relPath[idx...].firstIndex(of: "/") {
+                let prefix = String(relPath[..<slash])
+                if deletedDirs.contains(prefix) { top = prefix; break }
+                idx = relPath.index(after: slash)
+            }
+            return top
+        }
+        var dirCount: [String: Int] = [:]
+        var dirBytes: [String: Int64] = [:]
+        var standalone: [(String, String)] = []
+        for a in deletions {
+            if let t = topDir(a.relPath) {
+                dirCount[t, default: 0] += 1
+                dirBytes[t, default: 0] += a.dst?.size ?? 0
+            } else if a.dst?.kind == .directory {
+                dirCount[a.relPath, default: 0] += 0
+            } else {
+                let size = a.dst?.kind == .file ? Format.bytes(a.dst?.size ?? 0) : "symlink"
+                standalone.append((a.relPath, size))
+            }
+        }
+        var rows: [(String, String)] = dirCount.map { dir, n in
+            (dir + "/", n == 0 ? "empty directory" : "\(Format.count(n)) items inside, \(Format.bytes(dirBytes[dir] ?? 0))")
+        }
+        rows += standalone
+        rows.sort { $0.0 < $1.0 }
+        let width = min(70, rows.map { $0.0.count }.max() ?? 0)
+        lines = rows.map { path, note in
+            let p = path.count > width ? Format.fit(path, width) : path
+            return p.padding(toLength: width, withPad: " ", startingAt: 0) + "  " + note
+        }
+    }
 }
 
 /// Builds the live status block from a stats snapshot.
