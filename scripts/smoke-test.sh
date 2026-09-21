@@ -103,17 +103,19 @@ check "extraneous removed"                       '[ ! -e "$DST/extra.txt" ] && [
 check "trees identical"                          'diff -r --exclude=a-fifo --exclude=.DS_Store "$SRC" "$DST" >/dev/null 2>&1'
 
 echo
-echo "4b) answering 'n' at the delete prompt keeps extras but syncs the rest"
+echo "4b) deletion prompt comes AFTER copying; 'n' keeps extras, 'l' lists, 'y' deletes"
 echo "junk" > "$DST/keep-me.txt"; echo "newer" > "$SRC/docs/another.txt"
-out="$(printf 'n\n' | "$ISYNC" --no-color --delete "$SRC" "$DST" 2>&1)"; rc=$?
+out="$(printf 'n\n' | "$ISYNC" --no-color -v --delete "$SRC" "$DST" 2>&1)"; rc=$?
 check "exit 0"                                   '[ $rc -eq 0 ]'
 check "extra kept"                               '[ -f "$DST/keep-me.txt" ]'
 check "other work still done"                    '[ -f "$DST/docs/another.txt" ]'
-check "verdict mentions extras remain"           'echo "$out" | grep -q "extra items remain"'
-out="$(printf 'q\n' | "$ISYNC" --no-color --delete "$SRC" "$DST" 2>&1)"; rc=$?
-check "'q' aborts with exit 1"                   '[ $rc -eq 1 ] && [ -f "$DST/keep-me.txt" ]'
-out="$(printf 'y\n' | "$ISYNC" --no-color --delete "$SRC" "$DST" 2>&1)"; rc=$?
-check "'y' deletes"                              '[ $rc -eq 0 ] && [ ! -e "$DST/keep-me.txt" ]'
+check "list shown before copying starts"         '[ "$(echo "$out" | grep -n "keep-me.txt" | head -1 | cut -d: -f1)" -lt "$(echo "$out" | grep -n "copy .*another.txt" | head -1 | cut -d: -f1)" ]'
+check "question asked after copying"             '[ "$(echo "$out" | grep -n "copy .*another.txt" | head -1 | cut -d: -f1)" -lt "$(echo "$out" | grep -n "Delete them?" | head -1 | cut -d: -f1)" ]'
+check "verdict mentions extras kept"             'echo "$out" | grep -q "kept at your request"'
+out="$(printf 'l\ny\n' | "$ISYNC" --no-color --delete "$SRC" "$DST" 2>&1)"; rc=$?
+check "'l' lists the path, then 'y' deletes"     '[ $rc -eq 0 ] && echo "$out" | grep -q "^    keep-me.txt" && [ ! -e "$DST/keep-me.txt" ]'
+out="$("$ISYNC" --no-color --delete "$SRC" "$DST" 2>&1 < /dev/null)"; rc=$?
+check "no stdin: nothing asked, exit 0"          '[ $rc -eq 0 ]'
 
 echo
 echo "5) type changes: file→dir, dir→file, symlink→file"

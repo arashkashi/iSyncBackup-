@@ -221,46 +221,25 @@ func run() -> Int32 {
             term.log(term.red("✖ Refusing to delete: ") + "the source scan had errors, so 'missing from source' cannot be trusted. Fix the errors or drop --delete.")
             return 1
         }
-        if !opts.yes {
-            // Answers are read from stdin; end-of-input (e.g. cron with no terminal) counts as "no".
-            let extra = plan.postDeletes.count
-            let extraBytes = plan.postDeletes.reduce(0) { $0 + ($1.dst?.size ?? 0) }
+        if !opts.yes && !plan.postDeletes.isEmpty {
+            // Show the list now so it can be reviewed while the copying runs; the question itself is
+            // asked by the executor right before the deletions would happen, after all copying and
+            // verification — so a slow answer never holds up the real work.
             if plan.typeConflicts > 0 {
                 term.log(term.yellow("  \(plan.typeConflicts) path(s) changed type and will be replaced either way (that is an update, not a deletion)."))
             }
-            if extra > 0 {
-                term.log("  \(Format.count(extra)) item(s) (\(Format.bytes(extraBytes))) exist only in the destination and would be deleted:")
-                let summary = DeletionSummary(plan.postDeletes)
-                let maxLines = 30
-                for line in summary.lines.prefix(maxLines) { term.log("    " + line) }
-                if summary.lines.count > maxLines {
-                    term.log(term.dim("    … and \(Format.count(summary.lines.count - maxLines)) more entries"))
-                }
-                var decided = false
-                while !decided {
-                    FileHandle.standardError.write("  Delete them?  [y] yes   [n] no — keep them, sync everything else   [l] list every path   [q] quit  (default n): ".data(using: .utf8)!)
-                    let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
-                    switch answer {
-                    case "y", "yes":
-                        decided = true
-                    case "l", "list":
-                        for a in plan.postDeletes.sorted(by: { $0.relPath < $1.relPath }) {
-                            let size = a.dst?.kind == .file ? "  " + Format.bytes(a.dst?.size ?? 0) : (a.dst?.kind == .directory ? "  (dir)" : "  (symlink)")
-                            term.log("    " + a.relPath + term.dim(size))
-                        }
-                    case "q", "quit", "a", "abort":
-                        term.log("Aborted; nothing was changed.")
-                        return 1
-                    default:
-                        plan.extraneous += extra
-                        plan.extraneousBytes += extraBytes
-                        plan.postDeletes = []
-                        term.log(term.dim("  keeping them; continuing without deletions" + (isatty(STDIN_FILENO) == 1 ? "" : " (no terminal; pass --yes to delete unattended)")))
-                        decided = true
-                    }
-                }
+            let extra = plan.postDeletes.count
+            let extraBytes = plan.postDeletes.reduce(0) { $0 + ($1.dst?.size ?? 0) }
+            term.log(term.bold("  \(Format.count(extra)) item(s) (\(Format.bytes(extraBytes))) exist only in the destination:"))
+            let summary = DeletionSummary(plan.postDeletes)
+            let maxLines = 30
+            for line in summary.lines.prefix(maxLines) { term.log("    " + line) }
+            if summary.lines.count > maxLines {
+                term.log(term.dim("    … and \(Format.count(summary.lines.count - maxLines)) more entries (answer 'l' at the prompt to list all)"))
             }
+            term.log(term.dim("  You will be asked whether to delete them once copying and verification are done."))
             term.log("")
+            stats.update { $0.deletesPending = extra }
         }
     }
 
@@ -278,6 +257,38 @@ func run() -> Int32 {
     execOptions.comparePermissions = !limited
     // Errors are shown the moment they happen, above the progress block, not just at the end.
     execOptions.onError = { e in term.log(term.red("  error: ") + e.description) }
+    if !opts.yes && !opts.dryRun && !plan.postDeletes.isEmpty {
+        let deletions = plan.postDeletes
+        execOptions.confirmDeletions = {
+            term.stopLive()
+            let extra = deletions.count
+            let extraBytes = deletions.reduce(0) { $0 + ($1.dst?.size ?? 0) }
+            term.log(term.bold("Copying and verification are done. ") + "\(Format.count(extra)) item(s) (\(Format.bytes(extraBytes))) exist only in the destination (listed above).")
+            var approved = false
+            var decided = false
+            while !decided {
+                FileHandle.standardError.write("  Delete them?  [y] yes   [n] no — keep them   [l] list every path  (default n): ".data(using: .utf8)!)
+                // End of input (no terminal, e.g. cron without --yes) counts as "no".
+                let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
+                switch answer {
+                case "y", "yes":
+                    approved = true; decided = true
+                case "l", "list":
+                    for a in deletions.sorted(by: { $0.relPath < $1.relPath }) {
+                        let size = a.dst?.kind == .file ? "  " + Format.bytes(a.dst?.size ?? 0) : (a.dst?.kind == .directory ? "  (dir)" : "  (symlink)")
+                        term.log("    " + a.relPath + term.dim(size))
+                    }
+                default:
+                    term.log(term.dim("  keeping them" + (isatty(STDIN_FILENO) == 1 ? "" : " (no terminal; pass --yes to delete unattended)")))
+                    decided = true
+                }
+            }
+            term.log("")
+            stats.update { $0.deletesPending = 0 }
+            if !opts.quiet { term.startLive { frame.lines() } }
+            return approved
+        }
+    }
     let listActions = (opts.verbose || opts.dryRun) && !opts.quiet
     if listActions {
         execOptions.onAction = { action, outcome in
@@ -294,6 +305,7 @@ func run() -> Int32 {
     // --- Summary & verdict --------------------------------------------------------------------
     let s = stats.snapshot
     let elapsed = Date().timeIntervalSince(s.startedAt)
+    let extrasLeft = plan.extraneous + s.deletesSkipped
     if listActions { term.log("") }
 
     if !opts.quiet {
@@ -307,7 +319,7 @@ func run() -> Int32 {
         if s.symlinks > 0 { lines.append("\(Format.count(s.symlinks)) symlinks") }
         if s.dirsCreated > 0 { lines.append("\(Format.count(s.dirsCreated)) directories created") }
         if s.deleted > 0 { lines.append("\(Format.count(s.deleted)) items deleted") }
-        if plan.extraneous > 0 { lines.append(term.yellow("\(Format.count(plan.extraneous)) extra items remain in the destination (no --delete)")) }
+        if extrasLeft > 0 { lines.append(term.yellow("\(Format.count(extrasLeft)) extra items remain in the destination" + (s.deletesSkipped > 0 ? " (kept at your request)" : " (no --delete)"))) }
         lines.append("elapsed \(Format.duration(elapsed))" + (s.bytesCopied > 0 && elapsed > 0 ? " · \(Format.rate(Double(s.bytesCopied) / elapsed)) effective" : ""))
         term.log(term.bold("Summary  ") + lines.joined(separator: "\n         "))
     }
@@ -375,7 +387,7 @@ func run() -> Int32 {
                           filesCopied: s.filesCopied, bytesCopied: s.bytesCopied, filesUpdated: s.filesUpdated,
                           hashedIdentical: s.hashedIdentical, verified: s.verified, metadataUpdated: s.metaUpdated,
                           symlinks: s.symlinks, directoriesCreated: s.dirsCreated, directoryMetadataSet: s.dirMetaSet,
-                          deleted: s.deleted, extraneousLeft: plan.extraneous, typeConflicts: plan.typeConflicts,
+                          deleted: s.deleted, extraneousLeft: extrasLeft, typeConflicts: plan.typeConflicts,
                           skippedSpecial: plan.skippedSpecial.count, sourceChangedDuringCopy: s.sourceChangedDuringCopy),
             errors: s.errors, warnings: s.warnings, skippedSpecial: plan.skippedSpecial.map { $0.relPath })
         do { try report.write(to: path); if !opts.quiet { term.log(term.dim("report written to \(path)")) } }
@@ -502,6 +514,7 @@ final class FrameBuilder {
             case .deleting: phaseName = "Deleting extraneous items"
             case .directoryMetadata: phaseName = "Applying directory metadata"
             case .flushing: phaseName = "Flushing destination to disk"
+            case .confirming: phaseName = "Waiting for your answer"
             default: phaseName = s.phase.rawValue
             }
             out.append("\(spin) \(term.bold(phaseName))   " + term.dim("elapsed \(Format.duration(elapsed))")
@@ -520,6 +533,9 @@ final class FrameBuilder {
             out.append("  " + counters.joined(separator: " · "))
             for (_, text) in s.current.sorted(by: { $0.key < $1.key }).prefix(3) {
                 out.append("  " + term.dim(Format.fit(text, width - 4)))
+            }
+            if s.deletesPending > 0 {
+                out.append("  " + term.yellow("▲ \(Format.count(s.deletesPending)) deletions await your approval — you will be asked when copying is done"))
             }
         }
         return out

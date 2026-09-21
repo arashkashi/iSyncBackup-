@@ -17,6 +17,10 @@ public struct ExecOptions {
     public var onAction: ((Action, String) -> Void)? = nil
     /// Called the moment an action fails, so errors can be shown while the run is still going.
     public var onError: ((SyncError) -> Void)? = nil
+    /// Asked once, right before extraneous items would be deleted — i.e. after all copying and
+    /// verification is done, so a slow answer never holds up the real work. Return false to keep
+    /// the items. Not called when there is nothing to delete.
+    public var confirmDeletions: (() -> Bool)? = nil
 
     public init() {}
 }
@@ -43,6 +47,7 @@ public final class Executor {
     private let cancel: Cancellation
     private let pendingLock = NSLock()
     private var pending: [Pending] = []
+    private var deletesApproved = true
 
     public init(plan: Plan, source: Tree, destination: Tree, options: ExecOptions, stats: Stats, cancellation: Cancellation) {
         self.plan = plan
@@ -76,8 +81,18 @@ public final class Executor {
         finalizeCopies()
         if cancel.isCancelled { noteUnfinalized(); return false }
 
+        if !plan.postDeletes.isEmpty, !options.dryRun, let confirm = options.confirmDeletions {
+            stats.setPhase(.confirming)
+            if !confirm() {
+                stats.update { $0.deletesSkipped = plan.postDeletes.count; $0.actionsDone += plan.postDeletes.count }
+                deletesApproved = false
+            }
+            if cancel.isCancelled { return false }
+        }
         stats.setPhase(.deleting)
-        for a in plan.postDeletes { if cancel.isCancelled { return false }; perform(a, index: -1, worker: 0) }
+        if deletesApproved {
+            for a in plan.postDeletes { if cancel.isCancelled { return false }; perform(a, index: -1, worker: 0) }
+        }
 
         stats.setPhase(.directoryMetadata)
         for a in plan.dirMeta { if cancel.isCancelled { return false }; perform(a, index: -1, worker: 0) }

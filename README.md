@@ -6,7 +6,7 @@ from the destination and SHA-256-checked before the tool says SYNCED.** A modern
 `rsync -a` on macOS — preserves Finder tags, extended attributes, resource forks, permissions and
 nanosecond timestamps on APFS — built in Swift with zero dependencies.
 
-![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-27%20unit%20%2B%2064%20e2e-success) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-32%20unit%20%2B%2072%20e2e-success) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ```
 isync ~/Pictures /Volumes/BackupDrive/Pictures            # mirror; never deletes without --delete
@@ -110,9 +110,12 @@ Names are matched the way the volume matches them: on case-insensitive APFS/HFS+
 ## Safety rails
 
 * Nothing is ever deleted from the destination without `--delete`.
-* `--delete` asks for confirmation (skip with `--yes`) and **refuses** to remove more than 25 % of
-  the destination unless you pass `--force` — the classic "source disk wasn't mounted, backup got
-  wiped" accident cannot happen by default.
+* `--delete` shows you exactly what would be removed (whole directories collapsed to one line
+  with their item count; `l` lists every path) and asks **after** all copying and verification is
+  done, so a slow answer never holds up the real work. "No" keeps the items and finishes the run.
+  `--yes` skips the question; no terminal on stdin counts as "no".
+* `--delete` **refuses** to remove more than 25 % of the destination unless you pass `--force` —
+  the classic "source disk wasn't mounted, backup got wiped" accident cannot happen by default.
 * `--delete` is also refused when the source scan had errors, since "missing from the source"
   cannot be trusted then.
 * Source inside destination → refused. Destination inside source → excluded from the scan.
@@ -192,9 +195,9 @@ to the nanosecond on APFS. Symlinks are copied as symlinks, never followed.
 
 ### Is `--delete` safe?
 
-It is opt-in, it shows the count and asks for confirmation, and it refuses outright to delete more
-than 25 % of the destination (the "source drive was not mounted" accident) unless you pass
-`--force`. Type changes (a file replaced by a folder) are handled without `--delete`, since they are
+It is opt-in. It lists what would go, does all the copying first, and only then asks; "no" keeps
+the items and the run still completes. It refuses outright to delete more than 25 % of the
+destination (the "source drive was not mounted" accident) unless you pass `--force`. Type changes (a file replaced by a folder) are handled without `--delete`, since they are
 updates, not removals.
 
 ### Can it detect bit rot or silent corruption on my backup drive?
@@ -243,10 +246,12 @@ isync -q --delete --yes --report ~/backup-report.json /Volumes/Archive /Volumes/
 
 ## Testing
 
-* `swift test` — 27 unit tests: the planner (case folding, mtime windows, type conflicts,
+* `swift test` — 32 unit tests: the planner (case folding, mtime windows, type conflicts,
   delete ordering, flag masking, ignore rules) and the two-pass copy (verification failure removes
-  the copy, scanned mtime is stamped even if the source changed, cancellation leaves no temp files).
-* `scripts/smoke-test.sh` — 64 end-to-end checks on a fixture tree: xattrs, modes, exact mtimes,
+  the copy, scanned mtime is stamped even if the source changed, cancellation leaves no temp files)
+  and the executor on real temporary trees (deletion question asked only after copying, decline
+  keeps items, approval deletes children first).
+* `scripts/smoke-test.sh` — 72 end-to-end checks on a fixture tree: xattrs, modes, exact mtimes,
   symlinks (relative, dangling, retargeted), unicode names, empty files/dirs, FIFOs, immutable
   files, same-size edits, touch-only changes, type changes in both directions, extraneous items with
   and without `--delete`, silent-corruption detection in audit mode, unreadable files, every

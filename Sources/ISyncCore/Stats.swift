@@ -47,6 +47,10 @@ public final class Stats {
         public var dirsCreated = 0
         public var dirMetaSet = 0
         public var deleted = 0
+        /// Extraneous deletions waiting for the user's answer (shown while copying runs).
+        public var deletesPending = 0
+        /// Extraneous deletions the user declined at the prompt.
+        public var deletesSkipped = 0
         public var sourceChangedDuringCopy = 0
         public var errors: [SyncError] = []
         public var warnings: [SyncError] = []
