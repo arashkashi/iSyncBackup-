@@ -1,25 +1,59 @@
-# isync — verified one-way folder mirroring for macOS
+# isync — verified folder and drive mirroring for macOS
 
-`isync` makes a destination folder (or volume) an exact mirror of a source folder, transferring
-only what changed, and does not say **SYNCED** unless it has evidence for it.
+**A fast, free command-line backup tool for Mac that mirrors a folder or an entire volume onto
+another drive, copies only what changed, and proves the result: every copied file is read back
+from the destination and SHA-256-checked before the tool says SYNCED.** A modern alternative to
+`rsync -a` on macOS — preserves Finder tags, extended attributes, resource forks, permissions and
+nanosecond timestamps on APFS — built in Swift with zero dependencies.
+
+![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-21%20unit%20%2B%2064%20e2e-success)
 
 ```
-isync ~/Documents /Volumes/Backup/Documents          # mirror; never deletes without --delete
-isync --delete ~/Documents /Volumes/Backup/Documents # true mirror, asks before deleting
-isync -n --delete ~/Documents /Volumes/Backup/Documents   # dry run: show the plan, change nothing
-isync --compare hash ~/Documents /Volumes/Backup/Documents   # audit: SHA-256 every file on both sides
+isync ~/Pictures /Volumes/BackupDrive/Pictures            # mirror; never deletes without --delete
+isync -n --delete ~/Pictures /Volumes/BackupDrive/Pictures    # dry run: see the plan, change nothing
+isync --delete ~/Pictures /Volumes/BackupDrive/Pictures       # true mirror, asks before deleting
+isync --compare hash ~/Pictures /Volumes/BackupDrive/Pictures # audit: SHA-256 every file, both sides
 ```
 
-Zero dependencies: a single Swift binary using only Apple's system frameworks. Direction is always
-**source → destination**; it is a backup tool, not a two-way sync.
+## Who this is for
 
-## Build
+- **You keep photos, video, music or project archives on an external drive** and want a second
+  drive that is an exact copy — with evidence, not hope.
+- **You back up one Mac volume to another** (a Thunderbolt/USB SSD, a second internal volume) from
+  the terminal or a scheduled job, and you want clear exit codes instead of a GUI.
+- **Your `rsync -a` script quietly changed behaviour.** macOS now ships Apple's `openrsync`, which
+  drops extended attributes and Finder tags unless you add `-E`, and truncates timestamps to whole
+  seconds. See [isync vs rsync](#isync-vs-rsync-on-macos) for measurements.
+- **You worry about bit rot / silent corruption on backup drives** and want an audit mode that
+  reads every byte on both sides and repairs what differs.
+- You want a free, scriptable alternative to Carbon Copy Cloner or ChronoSync for plain
+  folder mirroring, and you are comfortable with a command line.
 
-Requires Xcode (or the Command Line Tools) — nothing else.
+**Not for:** two-way sync, cloud storage, remote machines over SSH (use `rsync` there), or
+versioned history with "go back to last Tuesday" (that is Time Machine's job). Direction is always
+**source → destination**.
+
+## Contents
+
+- [Build and install](#build-and-install)
+- [What "synced" means — the trust model](#what-synced-means--the-trust-model)
+- [How it works](#how-it-works)
+- [Safety rails](#safety-rails)
+- [Exclusions](#exclusions)
+- [Exit codes](#exit-codes)
+- [Independent verification](#independent-verification)
+- [isync vs rsync on macOS](#isync-vs-rsync-on-macos)
+- [FAQ](#faq)
+- [Testing](#testing)
+- [Roadmap](#roadmap)
+
+## Build and install
+
+Requires Xcode or the Command Line Tools (`xcode-select --install`) — nothing else, no Homebrew.
 
 ```
 make build            # → .build/release/isync
-make install          # → /usr/local/bin/isync   (PREFIX=~/bin make install for a user install)
+PREFIX=$HOME/.local make install   # → ~/.local/bin/isync, no sudo  (or plain `make install` → /usr/local/bin)
 make test             # unit tests
 make smoke            # end-to-end tests on a temporary fixture tree
 ```
@@ -109,7 +143,7 @@ Trust should not rest on one implementation. `scripts/verify-independent.sh <src
 audits a mirror using only `find`, `stat`, `readlink`, `xattr`, `shasum` and `diff` — no isync
 code at all. Use it whenever you want a second opinion.
 
-## Why not just rsync?
+## isync vs rsync on macOS
 
 macOS 26 ships Apple's `openrsync`, not the upstream rsync 3.x. Measured on the same 62,490-entry /
 1.9 GB tree, APFS→APFS, Apple silicon:
@@ -129,6 +163,58 @@ macOS 26 ships Apple's `openrsync`, not the upstream rsync 3.x. Measured on the 
 The two tools' outputs were cross-checked with `diff -rq` and found identical. `rsync` remains the
 right choice when the far end is a remote machine over SSH; `isync` is for local disks and mounted
 volumes where you want certainty and speed.
+
+## FAQ
+
+### How do I mirror an external drive to another drive on macOS from the terminal?
+
+```
+isync -x --delete /Volumes/Archive /Volumes/ArchiveBackup/Archive
+```
+
+`-x` stays on the source volume (does not descend into other mounts), `--delete` makes the copy a
+true mirror and asks before removing anything. Re-run the same command whenever you like; unchanged
+files are not even read, so a rerun of a 60,000-file tree takes about a second and a half.
+
+### Does it preserve Finder tags, extended attributes, resource forks, ACLs and permissions?
+
+Yes, always, via `copyfile(3)` — the same mechanism Finder uses. Modification times are preserved
+to the nanosecond on APFS. Symlinks are copied as symlinks, never followed.
+
+### Is `--delete` safe?
+
+It is opt-in, it shows the count and asks for confirmation, and it refuses outright to delete more
+than 25 % of the destination (the "source drive was not mounted" accident) unless you pass
+`--force`. Type changes (a file replaced by a folder) are handled without `--delete`, since they are
+updates, not removals.
+
+### Can it detect bit rot or silent corruption on my backup drive?
+
+`isync --compare hash` reads every byte of every file on both sides and repairs any mismatch. Quick
+mode — like rsync and Time Machine — trusts size + modification time for files it did not copy, so
+run the hash audit periodically (about 300 MB/s on small files; disk-bound on large ones).
+
+### Why not Time Machine, Carbon Copy Cloner or rsync?
+
+Different jobs. Time Machine keeps versioned history of your boot volume; isync keeps one drive an
+exact mirror of another. CCC and ChronoSync are excellent GUI tools; isync is free, scriptable and
+prints a verdict you can check in a cron job. Apple's bundled `openrsync` is compared
+[below](#isync-vs-rsync-on-macos); upstream rsync remains the right tool for remote machines.
+
+### Does it work with exFAT drives or a NAS/SMB share?
+
+It detects those filesystems and relaxes the comparison (2-second timestamp window, permissions not
+compared) so every run does not "fix" things they cannot store. It has been tested extensively on
+APFS→APFS; treat other targets as supported-but-less-tested and run `--compare hash` after the
+first sync.
+
+### Can I schedule it?
+
+Yes. Exit code 0 means synced, anything else means look. A minimal `launchd` or cron line:
+
+```
+isync -q --delete --yes --report ~/backup-report.json /Volumes/Archive /Volumes/Backup/Archive || osascript -e 'display notification "Backup needs attention" with title "isync"'
+```
 
 ## Testing
 
