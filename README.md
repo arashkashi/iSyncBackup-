@@ -118,7 +118,7 @@ macOS 26 ships Apple's `openrsync`, not the upstream rsync 3.x. Measured on the 
 |---|---|---|
 | first copy | 37.4 s | 22.7 s |
 | no-op rerun | 7.3 s | 1.5 s |
-| full SHA-256 audit | n/a (`-c` uses MD4/MD5 checksums, no report) | 6.0 s |
+| full-content audit of both sides | 82 s (`-aEc`, MD4 checksums, single-threaded) | 6.0 s (`--compare hash`, SHA-256, 8 workers) |
 | xattrs / tags / resource forks | only with `-E`; silently dropped with plain `-a` | always |
 | mtime | truncated to whole seconds | nanosecond-exact |
 | copy verified by re-reading the destination | no | yes |
@@ -134,11 +134,11 @@ volumes where you want certainty and speed.
 
 * `swift test` — 21 unit tests on the planner (case folding, mtime windows, type conflicts,
   delete ordering, flag masking, ignore rules).
-* `scripts/smoke-test.sh` — 57 end-to-end checks on a fixture tree: xattrs, modes, exact mtimes,
+* `scripts/smoke-test.sh` — 64 end-to-end checks on a fixture tree: xattrs, modes, exact mtimes,
   symlinks (relative, dangling, retargeted), unicode names, empty files/dirs, FIFOs, immutable
   files, same-size edits, touch-only changes, type changes in both directions, extraneous items with
   and without `--delete`, silent-corruption detection in audit mode, unreadable files, every
-  safety refusal, `.isyncignore`.
+  safety refusal, destination-inside-source with `--delete`, `.isyncignore`.
 
 ## Roadmap
 

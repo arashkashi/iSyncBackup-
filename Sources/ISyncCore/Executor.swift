@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public struct ExecOptions {
     public var dryRun = false
@@ -155,13 +156,23 @@ public final class Executor {
         }
 
         var verifying = false
-        let result = try FileOps.copyFile(from: srcPath, to: dstPath, existing: a.dst, verify: options.verify,
+        var accounted: Int64 = 0
+        let result: CopyResult
+        do {
+            result = try FileOps.copyFile(from: srcPath, to: dstPath, existing: a.dst, verify: options.verify,
                                           fsync: options.fsync, buffer: buffer, cancelled: { self.cancel.isCancelled }) { srcBytes, io in
-            self.stats.addWork(bytes: Int64(srcBytes), io: Int64(io))
-            if srcBytes == 0 && !verifying {
-                verifying = true
-                self.stats.setCurrent(worker: worker, "✓ verifying \(a.relPath)")
+                accounted += Int64(srcBytes)
+                self.stats.addWork(bytes: Int64(srcBytes), io: Int64(io))
+                if srcBytes == 0 && !verifying {
+                    verifying = true
+                    self.stats.setCurrent(worker: worker, "✓ verifying \(a.relPath)")
+                }
             }
+        } catch {
+            // Keep the progress bar honest: the bytes this action was budgeted for are "done"
+            // (as a failure) even though they were never read.
+            if !(error is CancelledError) { stats.addWork(bytes: max(0, src.size - accounted), io: 0) }
+            throw error
         }
         stats.update {
             $0.filesCopied += 1
@@ -178,11 +189,19 @@ public final class Executor {
 
     private func hashCompare(_ a: Action, srcPath: String, dstPath: String, worker: Int, buffer: UnsafeMutableRawPointer) throws -> String {
         stats.setCurrent(worker: worker, "# hashing \(a.relPath)")
-        let (sd, sbytes) = try FileOps.hashFile(srcPath, buffer: buffer, cancelled: { self.cancel.isCancelled }) { n in
-            self.stats.addWork(bytes: 0, io: Int64(n))
-        }
-        let (dd, dbytes) = try FileOps.hashFile(dstPath, buffer: buffer, cancelled: { self.cancel.isCancelled }) { n in
-            self.stats.addWork(bytes: 0, io: Int64(n))
+        defer { stats.setCurrent(worker: worker, nil) }
+        let sd: SHA256Digest, dd: SHA256Digest
+        let sbytes: Int64, dbytes: Int64
+        do {
+            (sd, sbytes) = try FileOps.hashFile(srcPath, buffer: buffer, cancelled: { self.cancel.isCancelled }) { n in
+                self.stats.addWork(bytes: 0, io: Int64(n))
+            }
+            (dd, dbytes) = try FileOps.hashFile(dstPath, buffer: buffer, cancelled: { self.cancel.isCancelled }) { n in
+                self.stats.addWork(bytes: 0, io: Int64(n))
+            }
+        } catch {
+            if !(error is CancelledError) { stats.addWork(bytes: a.src?.size ?? 0, io: 0) }
+            throw error
         }
         if sd == dd && sbytes == dbytes {
             // Same bytes. Only bring the metadata (mtime etc.) in line so the next run is a quick skip.
@@ -191,7 +210,6 @@ public final class Executor {
             }
             stats.addWork(bytes: sbytes, io: 0)
             stats.update { $0.hashedIdentical += 1 }
-            stats.setCurrent(worker: worker, nil)
             return "identical by SHA-256 (\(a.reason))"
         }
         // Different: fall through to a real copy. The bytes already hashed are re-read; progress is

@@ -138,6 +138,19 @@ out="$(run --delete --yes --force "$WORK/small-src" "$WORK/big-dst")"; rc=$?
 check "--force allows it"                        '[ $rc -eq 0 ] && [ -z "$(ls "$WORK/big-dst")" ]'
 out="$(run "$SRC/docs" "$SRC")"; rc=$?
 check "source inside destination refused"        '[ $rc -eq 1 ]'
+# destination inside source: the backup folder must be excluded from the scan and --delete must
+# only ever touch things inside the backup folder, never the source's own files.
+N="$WORK/nest-src"; mkdir -p "$N/sub/deeper"; echo a > "$N/sub/f"; echo b > "$N/top.txt"; echo c > "$N/sub/deeper/g"
+out="$(run --delete --yes "$N" "$N/backup")"; rc=$?
+check "dest-inside-source: exit 0"               '[ $rc -eq 0 ]'
+check "dest-inside-source: source intact"        '[ -f "$N/sub/f" ] && [ -f "$N/top.txt" ] && [ -f "$N/sub/deeper/g" ]'
+check "dest-inside-source: mirrored"             '[ -f "$N/backup/sub/f" ] && [ -f "$N/backup/top.txt" ] && [ -f "$N/backup/sub/deeper/g" ]'
+check "dest-inside-source: not recursive"        '[ ! -e "$N/backup/backup" ]'
+echo stale > "$N/backup/stale.txt"; rm "$N/top.txt"
+out="$(run --delete --yes "$N" "$N/backup")"; rc=$?
+check "dest-inside-source: 2nd run exit 0"       '[ $rc -eq 0 ]'
+check "dest-inside-source: extraneous removed inside backup only" '[ ! -e "$N/backup/stale.txt" ] && [ ! -e "$N/backup/top.txt" ] && [ -f "$N/sub/f" ] && [ -f "$N/sub/deeper/g" ]'
+check "dest-inside-source: still not recursive"  '[ ! -e "$N/backup/backup" ]'
 out="$(run "$SRC" "$SRC")"; rc=$?
 check "same dir refused"                         '[ $rc -eq 1 ]'
 
