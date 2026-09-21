@@ -8,11 +8,199 @@ nanosecond timestamps on APFS — built in Swift with zero dependencies.
 
 ![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-32%20unit%20%2B%2072%20e2e-success) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Common use cases](#common-use-cases)
+- [Reading the result](#reading-the-result)
+- [All options](#all-options)
+- [Who this is for](#who-this-is-for)
+- [Details](#details): [trust model](#what-synced-means--the-trust-model) · [how it works](#how-it-works) · [safety rails](#safety-rails) · [exclusions](#exclusions) · [isync vs rsync](#isync-vs-rsync-on-macos) · [FAQ](#faq) · [testing](#testing) · [roadmap](#roadmap) · [license](#license)
+
+## Install
+
+Requires Xcode or the Command Line Tools (`xcode-select --install`). Nothing else — no Homebrew,
+no packages.
+
+```bash
+git clone https://github.com/arashkashi/iSyncBackup-.git
+cd iSyncBackup-
+PREFIX=$HOME/.local make install      # → ~/.local/bin/isync, no sudo
+isync --version
 ```
-isync ~/Pictures /Volumes/BackupDrive/Pictures            # mirror; never deletes without --delete
-isync -n --delete ~/Pictures /Volumes/BackupDrive/Pictures    # dry run: see the plan, change nothing
-isync --delete ~/Pictures /Volumes/BackupDrive/Pictures       # true mirror, asks before deleting
-isync --compare hash ~/Pictures /Volumes/BackupDrive/Pictures # audit: SHA-256 every file, both sides
+
+`~/.local/bin` must be on your `PATH` (add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` if
+it is not). Prefer a system-wide install? `sudo make install` → `/usr/local/bin/isync`.
+
+To upgrade later: `git pull && PREFIX=$HOME/.local make install`.
+
+## Quick start
+
+Mirror a folder onto an external drive, then keep it up to date:
+
+```bash
+# 1. first copy — creates the destination folder if its parent exists
+isync ~/Pictures /Volumes/BackupDrive/Pictures
+
+# 2. later: preview what a rerun would do (changes nothing)
+isync -n --delete ~/Pictures /Volumes/BackupDrive/Pictures
+
+# 3. rerun for real. Unchanged files are not even read; only differences are copied.
+isync --delete ~/Pictures /Volumes/BackupDrive/Pictures
+```
+
+The last line of every run is the verdict. If it does not say **✔ SYNCED**, the backup is not
+complete, and the lines above it say why.
+
+## Common use cases
+
+### Back up a folder (never deletes anything)
+
+```bash
+isync ~/Documents /Volumes/BackupDrive/Documents
+```
+
+New and changed files are copied and verified. Files you deleted from `~/Documents` stay in the
+backup; the summary tells you how many ("N extra items remain in the destination").
+
+### Keep an exact mirror (deletes what you deleted)
+
+```bash
+isync --delete ~/Documents /Volumes/BackupDrive/Documents
+```
+
+`--delete` shows what would be removed, then does all the copying first, and only then asks:
+
+```
+  1,022 item(s) (21.9 MB) exist only in the destination:
+    MyProjects/old-app/node_modules/   612 items inside, 12.1 MB
+    tmp/export-2024/                   300 items inside, 8.0 MB
+    Misc/notes-draft.txt               14 KB
+  You will be asked whether to delete them once copying and verification are done.
+  …
+  Delete them?  [y] yes   [n] no — keep them   [l] list every path  (default n):
+```
+
+You can walk away during the copy. `n` (or just Enter) keeps the items and the run still completes.
+`--yes` answers yes without asking (for scripts). It refuses to delete more than 25 % of the
+destination unless you add `--force`.
+
+### Preview before doing anything
+
+```bash
+isync -n --delete SRC DST        # -n = dry run: prints every action, changes nothing
+```
+
+### Back up an entire volume
+
+```bash
+isync -x --delete /Volumes/Archive /Volumes/ArchiveBackup/Archive
+```
+
+`-x` stays on the source volume (does not descend into other mounted volumes). macOS housekeeping
+(`.Spotlight-V100`, `.fseventsd`, `.Trashes`, `.DS_Store`, …) is skipped automatically. If you see
+"Operation not permitted" on folders like `~/Library`, give your terminal **Full Disk Access** in
+System Settings → Privacy & Security.
+
+### Skip caches and junk
+
+Put a `.isyncignore` file in the source root (one glob per line, `#` comments):
+
+```
+.build/
+node_modules/
+.venv/
+__pycache__/
+DerivedData/
+*.tmp
+```
+
+Name patterns match anywhere in the tree; patterns containing `/` are relative to the root;
+a trailing `/` means directories only. `--exclude PATTERN` does the same from the command line.
+On a developer's disk these few lines typically remove more than half of all files.
+
+### Check that the backup is really intact (audit)
+
+```bash
+isync --compare hash ~/Documents /Volumes/BackupDrive/Documents
+```
+
+Reads every byte of every file on both sides, compares SHA-256, and repairs whatever differs. This
+is the only mode that catches a backup drive silently corrupting a file (bit rot). Run it now and
+then — it is fast on SSDs (about 300 MB/s on small files, disk-bound on large ones).
+
+### First big copy onto a spinning hard drive
+
+Hard drives hate per-file seeks. For the initial copy of hundreds of thousands of files onto one,
+copy in bulk first and let the audit read everything back sequentially afterwards:
+
+```bash
+isync -x --delete --no-fsync --no-verify SRC DST
+isync -x --compare hash SRC DST
+```
+
+Also keep `-j 2` on a hard drive (parallel readers only add seeks), exclude caches (above), and
+add the backup volume to System Settings → Spotlight → Search Privacy so indexing does not compete
+for the disk.
+
+### Schedule it
+
+Exit code 0 means synced; anything else means look. A cron or `launchd` line:
+
+```bash
+isync -q --delete --yes --report ~/backup-report.json /Volumes/Archive /Volumes/Backup/Archive \
+  || osascript -e 'display notification "Backup needs attention" with title "isync"'
+```
+
+`--report` writes a JSON file with every count, every error and the verdict — the auditable record.
+
+### Get a second opinion, without trusting isync
+
+```bash
+scripts/verify-independent.sh SRC DST --hash
+```
+
+Audits a mirror using only `find`, `stat`, `readlink`, `xattr`, `shasum` and `diff` — no isync
+code at all.
+
+## Reading the result
+
+| Last line | Meaning | Exit |
+|---|---|---|
+| `✔ SYNCED — … (all copies verified by SHA-256; …)` | Done. The parenthesis states exactly what was checked. | 0 |
+| `● DRY RUN — N action(s) would be performed` | Nothing was touched. | 0 |
+| `▲ SYNCED WITH WARNINGS — N file(s) changed while being copied` | Something was writing to the source mid-run. Run again. | 3 |
+| `✖ NOT SYNCED — N error(s)` | Everything else was synced; the listed files were not. | 2 |
+| `✖ Refusing: …` | A safety rail stopped it before doing anything (e.g. source drive not mounted). | 1 |
+| `✖ INTERRUPTED` | Ctrl-C. Completed files are complete; the next run picks up the rest. | 130 |
+
+While it runs you see the phase, a progress bar, throughput, ETA, the files each worker is on, and
+errors the moment they happen.
+
+## All options
+
+```
+isync [options] <source> <destination>
+
+  -n, --dry-run             Show what would happen; change nothing (hashes are still computed).
+      --delete              Remove items from destination that no longer exist in source.
+      --force               Skip the safety guard that refuses to delete >25% of the destination.
+  -y, --yes                 Delete without asking (the prompt shows the list; "no" keeps the
+                            items and syncs the rest; no terminal counts as "no").
+      --compare quick|hash  quick (default): size + mtime + permissions, hashing only when in doubt.
+                            hash: SHA-256 every file on both sides (full audit; reads everything).
+      --no-verify           Skip re-reading each copied file to confirm the bytes on disk.
+      --no-fsync            Skip per-file fsync (faster on many small files; less crash-safe).
+      --exclude PATTERN     Glob to skip (repeatable). Name match if no "/", else relative path.
+      --no-default-excludes Also copy .DS_Store, .Spotlight-V100, .fseventsd, .Trashes, … .
+  -x, --one-file-system     Do not descend into other mounted volumes.
+  -j, --jobs N              Parallel file workers (default: cores, max 8).
+      --mtime-window SEC    Treat mtimes this close as equal (default: 0 APFS→APFS, 1 with HFS+,
+                            2 FAT/exFAT/network).
+      --report FILE         Write a JSON report of the run.
+  -v, --verbose             Print one line per action.
+  -q, --quiet               Only print the final verdict and errors.
+      --no-color            Disable colors (also honours NO_COLOR).
+  -h, --help / --version
 ```
 
 ## Who this is for
@@ -33,31 +221,9 @@ isync --compare hash ~/Pictures /Volumes/BackupDrive/Pictures # audit: SHA-256 e
 versioned history with "go back to last Tuesday" (that is Time Machine's job). Direction is always
 **source → destination**.
 
-## Contents
+---
 
-- [Build and install](#build-and-install)
-- [What "synced" means — the trust model](#what-synced-means--the-trust-model)
-- [How it works](#how-it-works)
-- [Safety rails](#safety-rails)
-- [Exclusions](#exclusions)
-- [Exit codes](#exit-codes)
-- [Independent verification](#independent-verification)
-- [isync vs rsync on macOS](#isync-vs-rsync-on-macos)
-- [FAQ](#faq)
-- [Testing](#testing)
-- [Roadmap](#roadmap)
-- [License](#license)
-
-## Build and install
-
-Requires Xcode or the Command Line Tools (`xcode-select --install`) — nothing else, no Homebrew.
-
-```
-make build            # → .build/release/isync
-PREFIX=$HOME/.local make install   # → ~/.local/bin/isync, no sudo  (or plain `make install` → /usr/local/bin)
-make test             # unit tests
-make smoke            # end-to-end tests on a temporary fixture tree
-```
+# Details
 
 ## What "synced" means — the trust model
 
@@ -74,7 +240,7 @@ Honest limits:
 * **Quick mode is a heuristic.** A file whose content changed while its size and mtime stayed
   identical (a deliberately back-dated write, or bit rot on the *destination*) is invisible to it —
   the same is true of `rsync`, Time Machine and every other incremental tool. Run `--compare hash`
-  periodically (it is fast: ~500 MB/s on small files, disk-bound on large ones) to catch it.
+  periodically to catch it.
 * **Verification proves the copy reached the drive**, not that the drive will still return it in
   five years. For that, keep more than one backup.
 * **Read-back bypasses the OS page cache** (`F_NOCACHE`), so it reads what the filesystem stored,
@@ -102,7 +268,8 @@ Honest limits:
    destination file is deleted so the next run cannot mistake it for a good copy. If the source was
    modified during the run, the backup keeps the timestamp of the content it actually holds, the
    run ends with a warning (exit 3), and the next run picks up the new version.
-4. **Verdict** + optional JSON report (`--report run.json`) listing every error and every count.
+4. **Deletions** (only with `--delete`, and only after you have answered the question).
+5. **Verdict** + optional JSON report (`--report run.json`) listing every error and every count.
 
 Names are matched the way the volume matches them: on case-insensitive APFS/HFS+ (the default),
 `Readme.md` and `README.MD` are the same file, so no phantom copy/delete pairs.
@@ -127,33 +294,10 @@ Names are matched the way the volume matches them: on case-insensitive APFS/HFS+
 ## Exclusions
 
 Default: `.DS_Store .Spotlight-V100 .fseventsd .Trashes .TemporaryItems .DocumentRevisions-V100`
-and a few more volume-housekeeping items (`--no-default-excludes` to keep them).
-Add your own with `--exclude PATTERN` or a `.isyncignore` file in the source root:
-
-```
-# name patterns match anywhere; path patterns are relative to the root
-node_modules/
-*.tmp
-Library/Caches/*
-```
-
-`-x` / `--one-file-system` stops at mount points when backing up a whole volume.
-
-## Exit codes
-
-| code | meaning |
-|---|---|
-| 0 | synced (per the mode's guarantee), or dry run finished |
-| 1 | bad arguments, or refused to start (safety rail) |
-| 2 | finished with errors — **not** synced |
-| 3 | synced, but some files changed *while* being copied; run again |
-| 130 | interrupted |
-
-## Independent verification
-
-Trust should not rest on one implementation. `scripts/verify-independent.sh <src> <dst> [--hash]`
-audits a mirror using only `find`, `stat`, `readlink`, `xattr`, `shasum` and `diff` — no isync
-code at all. Use it whenever you want a second opinion.
+and a few more volume-housekeeping items (`--no-default-excludes` to keep them). The same rules
+apply to both sides, so an excluded item in the destination is never deleted either.
+Add your own with `--exclude PATTERN` or a `.isyncignore` file in the source root (see
+[Skip caches and junk](#skip-caches-and-junk)). `-x` / `--one-file-system` stops at mount points.
 
 ## isync vs rsync on macOS
 
@@ -184,9 +328,9 @@ volumes where you want certainty and speed.
 isync -x --delete /Volumes/Archive /Volumes/ArchiveBackup/Archive
 ```
 
-`-x` stays on the source volume (does not descend into other mounts), `--delete` makes the copy a
-true mirror and asks before removing anything. Re-run the same command whenever you like; unchanged
-files are not even read, so a rerun of a 60,000-file tree takes about a second and a half.
+`-x` stays on the source volume, `--delete` makes the copy a true mirror and asks before removing
+anything. Re-run the same command whenever you like; unchanged files are not even read, so a rerun
+of a 60,000-file tree takes about a second and a half.
 
 ### Does it preserve Finder tags, extended attributes, resource forks, ACLs and permissions?
 
@@ -197,21 +341,21 @@ to the nanosecond on APFS. Symlinks are copied as symlinks, never followed.
 
 It is opt-in. It lists what would go, does all the copying first, and only then asks; "no" keeps
 the items and the run still completes. It refuses outright to delete more than 25 % of the
-destination (the "source drive was not mounted" accident) unless you pass `--force`. Type changes (a file replaced by a folder) are handled without `--delete`, since they are
-updates, not removals.
+destination (the "source drive was not mounted" accident) unless you pass `--force`. Type changes
+(a file replaced by a folder) are handled without `--delete`, since they are updates, not removals.
 
 ### Can it detect bit rot or silent corruption on my backup drive?
 
 `isync --compare hash` reads every byte of every file on both sides and repairs any mismatch. Quick
 mode — like rsync and Time Machine — trusts size + modification time for files it did not copy, so
-run the hash audit periodically (about 300 MB/s on small files; disk-bound on large ones).
+run the hash audit periodically.
 
 ### Why not Time Machine, Carbon Copy Cloner or rsync?
 
 Different jobs. Time Machine keeps versioned history of your boot volume; isync keeps one drive an
 exact mirror of another. CCC and ChronoSync are excellent GUI tools; isync is free, scriptable and
 prints a verdict you can check in a cron job. Apple's bundled `openrsync` is compared
-[below](#isync-vs-rsync-on-macos); upstream rsync remains the right tool for remote machines.
+[above](#isync-vs-rsync-on-macos); upstream rsync remains the right tool for remote machines.
 
 ### Does it work with exFAT drives or a NAS/SMB share?
 
@@ -222,32 +366,14 @@ first sync.
 
 ### It is slow on my external hard drive — what should I do?
 
-Spinning disks hate per-file seeks, and a verified copy costs a few per file. Three things help,
-in order of impact:
-
-1. **Exclude regenerable caches.** `.build/`, `node_modules/`, `.venv/`, `__pycache__/`,
-   `DerivedData/` in a `.isyncignore` typically remove more than half of all files.
-2. **Bulk-copy first, audit after.** For the first big copy onto a hard drive, skip the per-file
-   work and let the audit read everything sequentially afterwards — a stronger check delivered in a
-   drive-friendly order:
-   ```
-   isync -x --delete --no-fsync --no-verify SRC DST
-   isync -x --compare hash SRC DST
-   ```
-3. Keep `--jobs` low (`-j 2`) on a hard drive; parallel readers only add seeks.
-
-### Can I schedule it?
-
-Yes. Exit code 0 means synced, anything else means look. A minimal `launchd` or cron line:
-
-```
-isync -q --delete --yes --report ~/backup-report.json /Volumes/Archive /Volumes/Backup/Archive || osascript -e 'display notification "Backup needs attention" with title "isync"'
-```
+See [First big copy onto a spinning hard drive](#first-big-copy-onto-a-spinning-hard-drive):
+exclude caches, bulk-copy with `--no-fsync --no-verify` then audit with `--compare hash`, use
+`-j 2`, and keep Spotlight off the backup volume.
 
 ## Testing
 
 * `swift test` — 32 unit tests: the planner (case folding, mtime windows, type conflicts,
-  delete ordering, flag masking, ignore rules) and the two-pass copy (verification failure removes
+  delete ordering, flag masking, ignore rules), the two-pass copy (verification failure removes
   the copy, scanned mtime is stamped even if the source changed, cancellation leaves no temp files)
   and the executor on real temporary trees (deletion question asked only after copying, decline
   keeps items, approval deletes children first).
@@ -256,6 +382,8 @@ isync -q --delete --yes --report ~/backup-report.json /Volumes/Archive /Volumes/
   files, same-size edits, touch-only changes, type changes in both directions, extraneous items with
   and without `--delete`, silent-corruption detection in audit mode, unreadable files, every
   safety refusal, destination-inside-source with `--delete`, `.isyncignore`.
+
+`make test` and `make smoke` run them.
 
 ## Roadmap
 
