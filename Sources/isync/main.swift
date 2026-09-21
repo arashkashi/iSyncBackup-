@@ -354,7 +354,7 @@ func run() -> Int32 {
         exitCode = 0
         term.log(term.cyan(term.bold("● " + verdict)))
     } else if !s.warnings.isEmpty {
-        verdict = "SYNCED WITH WARNINGS — \(s.warnings.count) file(s) changed while being copied. Run again to capture their latest content."
+        verdict = "SYNCED WITH WARNINGS — \(s.warnings.count) item(s) changed or disappeared in the source during the run. Run again to capture the current state."
         exitCode = 3
         term.log(term.yellow(term.bold("▲ " + verdict)))
     } else {

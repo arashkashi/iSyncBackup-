@@ -182,13 +182,27 @@ public final class Executor {
         } catch is CancelledError {
             return
         } catch {
-            outcome = "ERROR \(error)"
-            let e = SyncError(path: a.relPath, op: a.kind.rawValue, message: "\(error)")
-            stats.error(e)
-            options.onError?(e)
+            if a.src != nil && sourceVanished(srcPath) {
+                // The source changed under us. Not a backup failure: the next scan will see the
+                // current state. Reported as a warning (exit 3), like "modified during the run".
+                outcome = "source vanished during the run"
+                let w = SyncError(path: a.relPath, op: a.kind.rawValue, message: "source no longer exists (removed during the run); run again")
+                stats.update { $0.sourceChangedDuringCopy += 1 }
+                stats.warning(w)
+            } else {
+                outcome = "ERROR \(error)"
+                let e = SyncError(path: a.relPath, op: a.kind.rawValue, message: "\(error)")
+                stats.error(e)
+                options.onError?(e)
+            }
         }
         stats.update { $0.actionsDone += 1 }
         options.onAction?(a, outcome)
+    }
+
+    private func sourceVanished(_ path: String) -> Bool {
+        var st = stat()
+        return lstat(path, &st) != 0 && errno == ENOENT
     }
 
     private func copy(_ a: Action, index: Int, from srcPath: String, to dstPath: String, worker: Int, buffer: UnsafeMutableRawPointer) throws -> String {
@@ -295,10 +309,15 @@ public final class Executor {
             } catch is CancelledError {
                 return
             } catch {
-                self.stats.update { if self.options.verify { $0.verifyFailed += 1 } }
-                let e = SyncError(path: a.relPath, op: "verify", message: "\(error)")
-                self.stats.error(e)
-                self.options.onError?(e)
+                if self.sourceVanished(srcPath) {
+                    self.stats.update { $0.sourceChangedDuringCopy += 1 }
+                    self.stats.warning(SyncError(path: a.relPath, op: "verify", message: "source no longer exists (removed during the run); run again"))
+                } else {
+                    self.stats.update { if self.options.verify { $0.verifyFailed += 1 } }
+                    let e = SyncError(path: a.relPath, op: "verify", message: "\(error)")
+                    self.stats.error(e)
+                    self.options.onError?(e)
+                }
             }
             self.stats.update {
                 $0.finalizeDone += 1

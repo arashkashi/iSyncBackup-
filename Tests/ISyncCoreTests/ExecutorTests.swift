@@ -110,6 +110,33 @@ final class ExecutorTests: XCTestCase {
         XCTAssertEqual(snap.deleted, 1)
     }
 
+    func testSourceRemovedDuringRunIsAWarningNotAnError() throws {
+        write(src + "/gone-dir/inner.txt", "x")
+        write(src + "/gone-file.txt", "y")
+        write(src + "/stays.txt", "z")
+        let (plan, s, d) = makePlan()
+        // Between scan and execution the source changes — like a build system cleaning its cache.
+        try FileManager.default.removeItem(atPath: src + "/gone-dir")
+        try FileManager.default.removeItem(atPath: src + "/gone-file.txt")
+        let (snap, ok) = run(plan, s, d)
+        XCTAssertTrue(ok)
+        XCTAssertTrue(snap.errors.isEmpty, "vanished sources are not backup failures: \(snap.errors)")
+        XCTAssertGreaterThanOrEqual(snap.warnings.count, 2)
+        XCTAssertTrue(snap.warnings.allSatisfy { $0.message.contains("no longer exists") })
+        XCTAssertTrue(exists(dst + "/stays.txt"), "the rest of the run still happens")
+        XCTAssertEqual(snap.verified, 1)
+    }
+
+    func testUnreadableSourceIsStillAnError() throws {
+        write(src + "/locked.txt", "secret")
+        chmod(src + "/locked.txt", 0)
+        defer { chmod(src + "/locked.txt", 0o644) }
+        let (plan, s, d) = makePlan()
+        let (snap, _) = run(plan, s, d)
+        XCTAssertEqual(snap.errors.count, 1)
+        XCTAssertTrue(snap.warnings.isEmpty)
+    }
+
     func testCopiedFilesAreVerifiedAndStamped() throws {
         write(src + "/f.txt", "hello")
         chmod(src + "/f.txt", 0o640)
