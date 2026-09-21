@@ -1,0 +1,14 @@
+# SwiftPM
+.build/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+DerivedData/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# isync runtime artifacts
+*.isync-report.json
+.isync-tmp-*
