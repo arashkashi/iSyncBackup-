@@ -249,7 +249,12 @@ Honest limits:
 
 ## How it works
 
-1. **Scan** source and destination in parallel (`readdir` + `lstat`, symlinks never followed).
+1. **Scan** source and destination at the same time, each with a pool of workers reading
+   different directories concurrently (`--scan-jobs`, default 8). Directory contents come from
+   `getattrlistbulk(2)` — one syscall returns the names *and* metadata of many entries instead of
+   a `stat` per entry — falling back to `readdir` + `fstatat` on any filesystem that will not
+   supply everything. Symlinks are never followed. Measured on a 491,827-item volume: **16.2s
+   before this work, 5.6s after (2.9x)**, producing a byte-identical tree.
 2. **Plan** — a pure diff producing ordered actions: removals for type changes (file↔dir↔symlink),
    `mkdir`s, file work, deletions (children before parents), directory metadata (deepest first).
    Big files are scheduled first so all workers stay busy to the end.
@@ -372,11 +377,15 @@ exclude caches, bulk-copy with `--no-fsync --no-verify` then audit with `--compa
 
 ## Testing
 
-* `swift test` — 32 unit tests: the planner (case folding, mtime windows, type conflicts,
+* `swift test` — 44 unit tests: the scanner (the bulk and portable read paths, and serial vs
+  parallel at 2/4/8/16 workers, must produce byte-identical trees — this is what lets the scan be
+  made faster without changing a single copy decision), the planner (case folding, mtime windows, type conflicts,
   delete ordering, flag masking, ignore rules), the two-pass copy (verification failure removes
   the copy, scanned mtime is stamped even if the source changed, cancellation leaves no temp files)
   and the executor on real temporary trees (deletion question asked only after copying, decline
   keeps items, approval deletes children first).
+* `swift test --filter ScanPerformanceTests` — prints the scan speedup over the original
+  implementation and fails if it ever regresses below 1.5x.
 * `scripts/smoke-test.sh` — 72 end-to-end checks on a fixture tree: xattrs, modes, exact mtimes,
   symlinks (relative, dangling, retargeted), unicode names, empty files/dirs, FIFOs, immutable
   files, same-size edits, touch-only changes, type changes in both directions, extraneous items with
