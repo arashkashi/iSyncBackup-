@@ -15,6 +15,7 @@ struct Options {
     var useDefaultExcludes = true
     var oneFileSystem = false
     var jobs = min(8, max(2, ProcessInfo.processInfo.activeProcessorCount))
+    var scanJobs = 8
     var mtimeWindow: Double? = nil
     var reportPath: String? = nil
     var verbose = false
@@ -43,6 +44,8 @@ struct Options {
           --exclude PATTERN     Glob to skip (repeatable). Name match if no "/", else relative path.
           --no-default-excludes Also copy .DS_Store, .Spotlight-V100, .fseventsd, .Trashes, … .
       -x, --one-file-system     Do not descend into other mounted volumes.
+          --scan-jobs N         Directories read at once while scanning (default 8). The tree is
+                                identical at any setting; only the speed changes.
       -j, --jobs N              Parallel file workers (default: \(min(8, max(2, ProcessInfo.processInfo.activeProcessorCount)))).
           --mtime-window SEC    Treat mtimes this close as equal (default: 0 APFS→APFS, 1 with HFS+, 2 FAT/exFAT/network).
           --report FILE         Write a JSON report of the run.
@@ -93,6 +96,9 @@ struct Options {
             case "--exclude": o.excludes.append(try value(a))
             case "--no-default-excludes": o.useDefaultExcludes = false
             case "-x", "--one-file-system": o.oneFileSystem = true
+            case "--scan-jobs":
+                guard let n = Int(try value(a)), n >= 1, n <= 64 else { throw UsageError(description: "--scan-jobs must be 1…64") }
+                o.scanJobs = n
             case "-j", "--jobs":
                 guard let n = Int(try value(a)), n >= 1, n <= 64 else { throw UsageError(description: "--jobs must be 1…64") }
                 o.jobs = n

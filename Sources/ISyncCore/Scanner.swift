@@ -8,11 +8,17 @@ public struct ScanOptions {
     /// Relative paths (already folded if the tree folds) to skip entirely — used to keep the
     /// destination out of the source scan when it lives inside it.
     public var skipRelPaths: Set<String>
+    /// Directories read concurrently. 1 keeps the original single-threaded walk. More workers let
+    /// the device queue several metadata reads at once, which is what makes a scan faster; the
+    /// resulting tree is identical either way.
+    public var jobs: Int
 
-    public init(excludes: IgnoreRules = IgnoreRules(), oneFileSystem: Bool = false, skipRelPaths: Set<String> = []) {
+    public init(excludes: IgnoreRules = IgnoreRules(), oneFileSystem: Bool = false,
+                skipRelPaths: Set<String> = [], jobs: Int = 1) {
         self.excludes = excludes
         self.oneFileSystem = oneFileSystem
         self.skipRelPaths = skipRelPaths
+        self.jobs = jobs
     }
 }
 
@@ -44,15 +50,16 @@ public final class Scanner {
     private let options: ScanOptions
     /// (entries so far, directory currently being read)
     private let progress: ((Int, String) -> Void)?
-    private var scannedCount = 0
     private var cancelled: () -> Bool
-    /// Reused across every directory; freed in deinit.
-    private let bulkBuffer = UnsafeMutableRawPointer.allocate(byteCount: BulkDirectory.bufferSize, alignment: 8)
     /// Set false by `ISYNC_NO_BULK=1` to force the portable readdir path (used by the tests that
     /// prove the two paths agree).
     private let useBulk = ProcessInfo.processInfo.environment["ISYNC_NO_BULK"] == nil
     /// Directories the bulk path could not handle (reported in the JSON report).
-    public private(set) var useBulkFailures = 0
+    public private(set) var bulkFailures = 0
+    private let counter = ScanProgress()
+    /// Entries a worker accumulates before merging into the shared tree. Bounds the extra memory
+    /// to roughly jobs x this many entries.
+    private static let mergeThreshold = 20_000
 
     public init(options: ScanOptions, cancelled: @escaping () -> Bool = { false }, progress: ((Int, String) -> Void)? = nil) {
         self.options = options
@@ -60,21 +67,19 @@ public final class Scanner {
         self.progress = progress
     }
 
-    deinit { bulkBuffer.deallocate() }
-
 
     /// Applies exclusions, resolves symlinks and records one entry. Shared by both read paths so
     /// they cannot drift apart.
     private func add(name: String, kind: EntryKind, size: Int64, mtime: timespec, mode: mode_t,
                      flags: UInt32, dev: dev_t, ino: ino_t, nlink: UInt16,
-                     absPath: String, parentRel: String, dfd: Int32, into tree: Tree,
-                     subdirs: inout [(abs: String, rel: String)]) {
+                     absPath: String, parentRel: String, dfd: Int32, tree: Tree,
+                     batch: inout ScanBatch, subdirs: inout [(abs: String, rel: String)]) {
         let rel = parentRel.isEmpty ? name : parentRel + "/" + name
         let abs = absPath == "/" ? "/" + name : absPath + "/" + name
 
-        if options.skipRelPaths.contains(tree.key(rel)) { tree.excludedCount += 1; return }
+        if options.skipRelPaths.contains(tree.key(rel)) { batch.excluded += 1; return }
         if options.excludes.matches(relPath: rel, name: name, isDirectory: kind == .directory) {
-            tree.excludedCount += 1
+            batch.excluded += 1
             return
         }
 
@@ -84,7 +89,7 @@ public final class Scanner {
             let n = readlinkat(dfd, name, &buf, buf.count - 1)
             if n < 0 {
                 if errno != ENOENT {
-                    tree.errors.append(SyncError(path: abs, op: "readlink", message: errnoMessage()))
+                    batch.errors.append(SyncError(path: abs, op: "readlink", message: errnoMessage()))
                 }
                 return
             }
@@ -92,11 +97,10 @@ public final class Scanner {
             linkTarget = String(cString: buf)
         }
 
-        tree.insert(Entry(relPath: rel, kind: kind, size: size, mtime: mtime, mode: mode,
-                          flags: flags, dev: dev, ino: ino, nlink: nlink, linkTarget: linkTarget))
-
-        scannedCount += 1
-        if scannedCount % 500 == 0 { progress?(scannedCount, parentRel) }
+        batch.entries.append((tree.key(rel),
+                              Entry(relPath: rel, kind: kind, size: size, mtime: mtime, mode: mode,
+                                    flags: flags, dev: dev, ino: ino, nlink: nlink, linkTarget: linkTarget)))
+        batch.scanned += 1
 
         if kind == .directory {
             if options.oneFileSystem && dev != tree.rootDev {
@@ -110,68 +114,112 @@ public final class Scanner {
         var st = stat()
         let rootDev: dev_t = lstat(root, &st) == 0 ? st.st_dev : 0
         let tree = Tree(root: root, foldKeys: foldKeys, fsType: Scanner.fsTypeName(root), rootDev: rootDev)
-        walk(directory: root, relPath: "", into: tree)
-        progress?(scannedCount, "")
+
+        let queue = DirectoryQueue(root: (root, ""))
+        let workers = max(1, options.jobs)
+        let merge = NSLock()
+
+        // One worker is just the plain walk; several read different directories at the same time
+        // so the device can have more than one metadata request in flight. Each worker keeps its
+        // own batch and merges under a lock, so the only contention is one lock per 20k entries.
+        let body: (Int) -> Void = { _ in
+            let buffer = UnsafeMutableRawPointer.allocate(byteCount: BulkDirectory.bufferSize, alignment: 8)
+            defer { buffer.deallocate() }
+            var batch = ScanBatch()
+
+            func flush() {
+                guard !batch.isEmpty else { return }
+                merge.lock()
+                for (key, entry) in batch.entries { tree.entries[key] = entry }
+                tree.errors.append(contentsOf: batch.errors)
+                tree.excludedCount += batch.excluded
+                self.bulkFailures += batch.bulkFailures
+                merge.unlock()
+                batch.reset()
+            }
+
+            while let dir = queue.next() {
+                var subdirs: [(abs: String, rel: String)] = []
+                if !self.cancelled() {
+                    let before = batch.scanned
+                    self.read(directory: dir.abs, relPath: dir.rel, tree: tree,
+                              batch: &batch, subdirs: &subdirs, buffer: buffer)
+                    let total = self.counter.add(batch.scanned - before)
+                    self.progress?(total, dir.rel)
+                }
+                queue.finish(pushing: subdirs)
+                if batch.entries.count >= Scanner.mergeThreshold { flush() }
+            }
+            flush()
+        }
+
+        if workers == 1 {
+            body(0)
+        } else {
+            DispatchQueue.concurrentPerform(iterations: workers, execute: body)
+        }
+        if cancelled() { queue.abort() }
+        progress?(counter.value, "")
         return tree
     }
 
-    private func walk(directory absPath: String, relPath parentRel: String, into tree: Tree) {
-        progress?(scannedCount, parentRel)
+    /// Reads one directory: records its entries into `batch` and returns its subdirectories.
+    private func read(directory absPath: String, relPath parentRel: String, tree: Tree,
+                      batch: inout ScanBatch, subdirs: inout [(abs: String, rel: String)],
+                      buffer: UnsafeMutableRawPointer) {
         guard let dir = opendir(absPath) else {
-            tree.errors.append(SyncError(path: absPath, op: "opendir", message: errnoMessage()))
+            // A directory that disappeared mid-scan is not an error worth reporting.
+            if errno != ENOENT {
+                batch.errors.append(SyncError(path: absPath, op: "opendir", message: errnoMessage()))
+            }
             return
         }
         defer { closedir(dir) }
         let dfd = dirfd(dir)
 
-        // Collect first, then recurse: keeps one open dir fd per depth level, not per sibling.
-        var subdirs: [(abs: String, rel: String)] = []
-
-        // Fast path: one syscall returns names and metadata for many entries at once. On a
-        // spinning disk this is ~30x faster than a stat per entry. It yields exactly the same
-        // fields, and falls back to readdir + fstatat whenever it cannot.
-        if useBulk, let raw = BulkDirectory.list(fd: dfd, buffer: bulkBuffer) {
+        // Fast path: one syscall returns names and metadata for many entries at once, instead of
+        // a stat per entry. It yields exactly the same fields, and falls back to readdir +
+        // fstatat whenever the filesystem will not supply everything we asked for.
+        if useBulk, let raw = BulkDirectory.list(fd: dfd, buffer: buffer) {
             for r in raw {
                 if cancelled() { return }
                 add(name: r.name, kind: r.kind, size: r.size, mtime: r.mtime, mode: r.mode,
                     flags: r.flags, dev: r.dev, ino: r.ino, nlink: r.nlink,
-                    absPath: absPath, parentRel: parentRel, dfd: dfd, into: tree, subdirs: &subdirs)
+                    absPath: absPath, parentRel: parentRel, dfd: dfd, tree: tree,
+                    batch: &batch, subdirs: &subdirs)
             }
-        } else {
-            useBulkFailures += 1
-            while let ent = readdir(dir) {
-                if cancelled() { return }
-                let name = withUnsafePointer(to: &ent.pointee.d_name) {
-                    $0.withMemoryRebound(to: CChar.self, capacity: Int(PATH_MAX)) { String(cString: $0) }
-                }
-                if name == "." || name == ".." { continue }
-
-                let abs = absPath == "/" ? "/" + name : absPath + "/" + name
-                var st = stat()
-                guard fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
-                    // ENOENT here means it vanished between readdir and stat — not worth an error.
-                    if errno != ENOENT {
-                        tree.errors.append(SyncError(path: abs, op: "lstat", message: errnoMessage()))
-                    }
-                    continue
-                }
-                let kind: EntryKind
-                switch st.st_mode & S_IFMT {
-                case S_IFREG: kind = .file
-                case S_IFDIR: kind = .directory
-                case S_IFLNK: kind = .symlink
-                default: kind = .other
-                }
-                add(name: name, kind: kind, size: kind == .file ? Int64(st.st_size) : 0,
-                    mtime: st.st_mtimespec, mode: st.st_mode & 0o7777, flags: st.st_flags,
-                    dev: st.st_dev, ino: st.st_ino, nlink: st.st_nlink,
-                    absPath: absPath, parentRel: parentRel, dfd: dfd, into: tree, subdirs: &subdirs)
-            }
+            return
         }
 
-        for sub in subdirs {
+        batch.bulkFailures += 1
+        while let ent = readdir(dir) {
             if cancelled() { return }
-            walk(directory: sub.abs, relPath: sub.rel, into: tree)
+            let name = withUnsafePointer(to: &ent.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(PATH_MAX)) { String(cString: $0) }
+            }
+            if name == "." || name == ".." { continue }
+
+            let abs = absPath == "/" ? "/" + name : absPath + "/" + name
+            var st = stat()
+            guard fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+                // ENOENT here means it vanished between readdir and stat — not worth an error.
+                if errno != ENOENT {
+                    batch.errors.append(SyncError(path: abs, op: "lstat", message: errnoMessage()))
+                }
+                continue
+            }
+            let kind: EntryKind
+            switch st.st_mode & S_IFMT {
+            case S_IFREG: kind = .file
+            case S_IFDIR: kind = .directory
+            case S_IFLNK: kind = .symlink
+            default: kind = .other
+            }
+            add(name: name, kind: kind, size: kind == .file ? Int64(st.st_size) : 0,
+                mtime: st.st_mtimespec, mode: st.st_mode & 0o7777, flags: st.st_flags,
+                dev: st.st_dev, ino: st.st_ino, nlink: st.st_nlink,
+                absPath: absPath, parentRel: parentRel, dfd: dfd, tree: tree,
+                batch: &batch, subdirs: &subdirs)
         }
     }
 }

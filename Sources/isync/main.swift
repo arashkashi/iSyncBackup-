@@ -142,7 +142,7 @@ func run() -> Int32 {
     let group = DispatchGroup()
     group.enter()
     DispatchQueue.global(qos: .userInitiated).async {
-        let scanner = Scanner(options: ScanOptions(excludes: rules, oneFileSystem: opts.oneFileSystem, skipRelPaths: skipRelPaths),
+        let scanner = Scanner(options: ScanOptions(excludes: rules, oneFileSystem: opts.oneFileSystem, skipRelPaths: skipRelPaths, jobs: opts.scanJobs),
                               cancelled: { cancellation.isCancelled },
                               progress: { n, dir in stats.update { $0.scannedSource = n; $0.scanningSource = dir } })
         sourceTree = scanner.scan(root: src, foldKeys: caseInsensitive)
@@ -152,7 +152,7 @@ func run() -> Int32 {
     group.enter()
     DispatchQueue.global(qos: .userInitiated).async {
         if isDirectory(dst) {
-            let scanner = Scanner(options: ScanOptions(excludes: rules, oneFileSystem: opts.oneFileSystem),
+            let scanner = Scanner(options: ScanOptions(excludes: rules, oneFileSystem: opts.oneFileSystem, jobs: opts.scanJobs),
                                   cancelled: { cancellation.isCancelled },
                                   progress: { n, dir in stats.update { $0.scannedDestination = n; $0.scanningDestination = dir } })
             destTree = scanner.scan(root: dst, foldKeys: caseInsensitive)

@@ -41,11 +41,28 @@ final class ScannerTests: XCTestCase {
         }.sorted()
     }
 
-    func scan(bulk: Bool, options: ScanOptions = ScanOptions()) -> Tree {
+    func scan(bulk: Bool, jobs: Int = 1, options: ScanOptions = ScanOptions()) -> Tree {
         // The scanner reads ISYNC_NO_BULK at init time.
         if bulk { unsetenv("ISYNC_NO_BULK") } else { setenv("ISYNC_NO_BULK", "1", 1) }
         defer { unsetenv("ISYNC_NO_BULK") }
-        return Scanner(options: options).scan(root: root, foldKeys: true)
+        var o = options
+        o.jobs = jobs
+        return Scanner(options: o).scan(root: root, foldKeys: true)
+    }
+
+    /// Builds a wide, deep tree so parallel workers genuinely interleave.
+    func makeWideTree() throws {
+        let fm = FileManager.default
+        for i in 0..<12 {
+            for j in 0..<6 {
+                let d = root + "/wide/d\(i)/s\(j)"
+                try fm.createDirectory(atPath: d, withIntermediateDirectories: true)
+                for k in 0..<10 {
+                    try Data(repeating: UInt8(k), count: k * 11).write(to: URL(fileURLWithPath: d + "/f\(k).bin"))
+                }
+                try fm.createSymbolicLink(atPath: d + "/l", withDestinationPath: "f1.bin")
+            }
+        }
     }
 
     func testBothReadPathsProduceIdenticalTrees() {
@@ -89,6 +106,50 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(t["a/fifo"]?.kind, .other)
         XCTAssertEqual(t["a/ünïcödé 🙂.txt"]?.kind, .file)
         XCTAssertEqual(t["a/b"]?.mode, 0o700)
+    }
+
+    func testSerialAndParallelScansAreIdentical() throws {
+        try makeWideTree()
+        let serial = scan(bulk: true, jobs: 1)
+        let reference = describe(serial)
+        XCTAssertGreaterThan(serial.count, 800, "tree must be big enough for workers to interleave")
+        for jobs in [2, 4, 8, 16] {
+            let parallel = scan(bulk: true, jobs: jobs)
+            XCTAssertEqual(parallel.count, serial.count, "entry count differs at jobs=\(jobs)")
+            XCTAssertEqual(describe(parallel), reference, "parallel scan differs from serial at jobs=\(jobs)")
+            XCTAssertEqual(parallel.excludedCount, serial.excludedCount, "excluded count differs at jobs=\(jobs)")
+            XCTAssertTrue(parallel.errors.isEmpty)
+        }
+    }
+
+    func testSerialAndParallelAgreeOnThePortablePathToo() throws {
+        try makeWideTree()
+        XCTAssertEqual(describe(scan(bulk: false, jobs: 8)), describe(scan(bulk: false, jobs: 1)))
+        // And across both dimensions at once.
+        XCTAssertEqual(describe(scan(bulk: false, jobs: 8)), describe(scan(bulk: true, jobs: 1)))
+    }
+
+    func testParallelScanRespectsExclusions() throws {
+        try makeWideTree()
+        var o = ScanOptions()
+        var rules = IgnoreRules()
+        rules.add("*.bin")
+        o.excludes = rules
+        o.skipRelPaths = ["wide/d3"]
+        XCTAssertEqual(describe(scan(bulk: true, jobs: 8, options: o)),
+                       describe(scan(bulk: true, jobs: 1, options: o)))
+        XCTAssertNil(scan(bulk: true, jobs: 8, options: o)["wide/d3"])
+    }
+
+    func testParallelScanTerminatesOnAnEmptyAndOnADeepTree() throws {
+        // A chain with one directory per level: only ever one unit of work available, so workers
+        // must block and wake correctly rather than exiting early.
+        var deep = root + "/chain"
+        for _ in 0..<40 { deep += "/x"; }
+        try FileManager.default.createDirectory(atPath: deep, withIntermediateDirectories: true)
+        try Data("end".utf8).write(to: URL(fileURLWithPath: deep + "/leaf.txt"))
+        XCTAssertEqual(describe(scan(bulk: true, jobs: 8)), describe(scan(bulk: true, jobs: 1)))
+        XCTAssertNotNil(scan(bulk: true, jobs: 8)["chain" + String(repeating: "/x", count: 40) + "/leaf.txt"])
     }
 
     func testPlansAreIdenticalWhicheverPathScanned() {

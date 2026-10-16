@@ -91,7 +91,8 @@ public final class Tree {
     public let foldKeys: Bool
     public let fsType: String
     public let rootDev: dev_t
-    public private(set) var entries: [String: Entry] = [:]
+    /// Keyed by `key(relPath)`. Written by Scanner under its merge lock.
+    public internal(set) var entries: [String: Entry] = [:]
     public var errors: [SyncError] = []
     /// Entries skipped because of `--one-file-system` or exclude rules (count only).
     public var excludedCount = 0

@@ -16,9 +16,10 @@ struct RawEntry {
 /// Reads a whole directory with `getattrlistbulk(2)`: one syscall returns the names *and* the
 /// metadata of many entries at once, instead of `readdir` plus an `fstatat` per entry.
 ///
-/// On a spinning disk this is the difference between ~100 and ~3,000 entries per second, because
-/// the per-file `fstatat` calls each cost a seek while the bulk call reads the directory's
-/// metadata in one go.
+/// Measured on a 491,827-item APFS volume: 15x fewer syscalls, and the scan drops from 16.5s to
+/// 12.7s. The saving is syscall and page-cache work, not physical I/O, so it is largest when the
+/// metadata is reachable quickly and smallest on a cold spinning disk, where the seek per
+/// directory dominates either way.
 ///
 /// It is strictly an optimisation: `list` returns nil whenever anything is not exactly as
 /// expected — the filesystem does not support the call, or an entry arrives without every
