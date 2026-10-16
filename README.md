@@ -6,7 +6,7 @@ from the destination and SHA-256-checked before the tool says SYNCED.** A modern
 `rsync -a` on macOS — preserves Finder tags, extended attributes, resource forks, permissions and
 nanosecond timestamps on APFS — built in Swift with zero dependencies.
 
-![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-32%20unit%20%2B%2072%20e2e-success) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue) ![language](https://img.shields.io/badge/Swift-5.9%2B-orange) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![tests](https://img.shields.io/badge/tests-44%20unit%20%2B%2072%20e2e-success) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 - [Install](#install)
 - [Quick start](#quick-start)
