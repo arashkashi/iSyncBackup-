@@ -10,6 +10,7 @@ nanosecond timestamps on APFS — built in Swift with zero dependencies.
 
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Examples](#examples)
 - [Common use cases](#common-use-cases)
 - [Reading the result](#reading-the-result)
 - [All options](#all-options)
@@ -51,6 +52,46 @@ isync --delete ~/Pictures /Volumes/BackupDrive/Pictures
 The last line of every run is the verdict. If it does not say **✔ SYNCED**, the backup is not
 complete, and the lines above it say why.
 
+## Examples
+
+The same list `isync --help` prints:
+
+```bash
+# Back up a folder. New and changed files are copied and verified;
+# nothing is ever deleted from the backup.
+isync ~/Documents /Volumes/BackupDrive/Documents
+
+# Dry run: print every action it would take, and change nothing.
+# Safe to run at any time — it only reads.
+isync -n --delete ~/Documents /Volumes/BackupDrive/Documents
+
+# Keep an exact mirror. Lists whatever exists only in the destination
+# and asks before removing it; answering no still finishes the copying.
+isync --delete ~/Documents /Volumes/BackupDrive/Documents
+
+# Back up a whole volume, staying on it (-x skips other mounts).
+isync -x --delete /Volumes/Archive /Volumes/ArchiveBackup/Archive
+
+# Skip caches and build junk. The same patterns can go in a
+# .isyncignore file in the source root, one per line.
+isync --exclude node_modules --exclude '*.tmp' ~/Code /Volumes/Backup/Code
+
+# Audit a backup you already have: re-reads every byte on both sides,
+# compares SHA-256 and repairs what differs. This is what catches a
+# drive silently corrupting a file (bit rot).
+isync --compare hash ~/Documents /Volumes/BackupDrive/Documents
+
+# Unattended (cron or launchd): never prompts, writes a JSON record.
+# Exit code 0 means synced; anything else means read the report.
+isync -q --yes --delete --report ~/isync-report.json SRC DST
+
+# First bulk copy onto a spinning hard drive — run BOTH lines.
+# The first skips per-file checks for speed, the second reads
+# everything back and verifies it. Do not skip the second line.
+isync -x --delete --no-fsync --no-verify SRC DST
+isync -x --compare hash SRC DST
+```
+
 ## Common use cases
 
 ### Back up a folder (never deletes anything)
@@ -84,7 +125,7 @@ You can walk away during the copy. `n` (or just Enter) keeps the items and the r
 `--yes` answers yes without asking (for scripts). It refuses to delete more than 25 % of the
 destination unless you add `--force`.
 
-### Preview before doing anything
+### Dry run: see what would change, change nothing
 
 ```bash
 isync -n --delete SRC DST        # -n = dry run: prints every action, changes nothing
@@ -186,21 +227,24 @@ isync [options] <source> <destination>
       --force               Skip the safety guard that refuses to delete >25% of the destination.
   -y, --yes                 Delete without asking (the prompt shows the list; "no" keeps the
                             items and syncs the rest; no terminal counts as "no").
-      --compare quick|hash  quick (default): size + mtime + permissions, hashing only when in doubt.
-                            hash: SHA-256 every file on both sides (full audit; reads everything).
+      --compare quick|hash  quick (default): size + mtime + permissions, hashing only when
+                            in doubt.  hash: SHA-256 every file on both sides (full audit).
       --no-verify           Skip re-reading each copied file to confirm the bytes on disk.
       --no-fsync            Skip per-file fsync (faster on many small files; less crash-safe).
       --exclude PATTERN     Glob to skip (repeatable). Name match if no "/", else relative path.
       --no-default-excludes Also copy .DS_Store, .Spotlight-V100, .fseventsd, .Trashes, … .
   -x, --one-file-system     Do not descend into other mounted volumes.
-  -j, --jobs N              Parallel file workers (default: cores, max 8).
-      --mtime-window SEC    Treat mtimes this close as equal (default: 0 APFS→APFS, 1 with HFS+,
-                            2 FAT/exFAT/network).
+      --scan-jobs N         Directories read at once while scanning (default 8). The tree is
+                            identical at any setting; only the speed changes.
+  -j, --jobs N              Parallel file workers (default: one per core, max 8).
+      --mtime-window SEC    Treat mtimes this close as equal (default: 0 APFS→APFS,
+                            1 with HFS+, 2 FAT/exFAT/network).
       --report FILE         Write a JSON report of the run.
   -v, --verbose             Print one line per action.
   -q, --quiet               Only print the final verdict and errors.
       --no-color            Disable colors (also honours NO_COLOR).
-  -h, --help / --version
+  -h, --help                Show this help.
+      --version             Show version.
 ```
 
 ## Who this is for
