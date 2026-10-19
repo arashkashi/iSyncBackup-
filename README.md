@@ -42,7 +42,7 @@ Mirror a folder onto an external drive, then keep it up to date:
 # 1. first copy — creates the destination folder if its parent exists
 isync ~/Pictures /Volumes/BackupDrive/Pictures
 
-# 2. later: preview what a rerun would do (changes nothing)
+# 2. later: dry run — print what a rerun would do, change nothing
 isync -n --delete ~/Pictures /Volumes/BackupDrive/Pictures
 
 # 3. rerun for real. Unchanged files are not even read; only differences are copied.
